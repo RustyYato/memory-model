@@ -13,6 +13,11 @@ pub struct Recycler<T> {
     heap: SyncWrapper<BinaryHeap<Empty<T>>>,
 }
 
+use std::fmt;
+impl<T> fmt::Debug for Recycler<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "Recycler<{}>", std::any::type_name::<T>()) }
+}
+
 struct Empty<T>(T);
 
 pub struct AutoCollect<'a, T: Recycle>(&'a mut Recycler<T>, T);

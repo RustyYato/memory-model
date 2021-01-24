@@ -1,12 +1,11 @@
 use std::{
     collections::{btree_map::Entry as BEntry, hash_map::Entry, BTreeMap, HashMap},
     convert::{Infallible, TryFrom},
-    fmt,
     hash::BuildHasher,
     ops::Range,
 };
 
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use slab::Slab;
 
 use crate::{recycle::Recycler, Pointer};
@@ -22,6 +21,16 @@ pub trait PointerMap {
         recycler: &mut Recycler<Vec<Pointer>>,
         f: F,
     ) -> Result<(), E>;
+}
+
+pub trait Metadata: Copy + Eq {
+    type Filter;
+
+    fn alloc() -> Self;
+
+    fn filter_all() -> Self::Filter;
+
+    fn does_invalidate(self, other: Self, filter: &mut Self::Filter) -> bool;
 }
 
 impl PointerMap for Vec<Vec<Pointer>> {
@@ -107,19 +116,23 @@ impl PointerMap for BTreeMap<u32, Vec<Pointer>> {
     }
 }
 
-pub struct MemoryBlock<M = BTreeMap<u32, Vec<Pointer>>> {
+#[derive(Debug)]
+pub struct MemoryBlock<D, M = BTreeMap<u32, Vec<Pointer>>> {
     memory: M,
-    ptr_info: FxHashMap<Pointer, PointerInfo>,
+    ptr_info: FxHashMap<Pointer, PointerInfo<D>>,
+    deallocated: FxHashSet<Pointer>,
     allocations: Slab<Vec<Pointer>>,
     vec_recycler: Recycler<Vec<Pointer>>,
 }
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct PointerInfo {
-    pub meta: Meta,
+pub struct PointerInfo<D> {
+    pub range: Range<u32>,
+    pub ptr_ty: PtrType,
     pub owns_allocation: bool,
     pub alloc_id: u32,
+    pub meta: D,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,27 +141,16 @@ pub enum PtrType {
     Exclusive,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Meta {
-    pub range: Range<u32>,
-    pub ptr_ty: PtrType,
-    pub read: bool,
-    pub write: bool,
-}
-
 const OK: Result = Ok(());
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub enum Error {
+    ReborrowInvalidatesSource,
+    UseAfterFree(Pointer),
     InvalidPtr(Pointer),
     NotExclusive(Pointer),
-    WriteInvalid(Pointer),
-    ReadInvalid(Pointer),
-    ExclusiveWriteInvalid(Pointer),
     DeallocateNonOwning(Pointer),
-    ReborrowReadPermission,
-    ReborrowWritePermission,
     AllocateRangeOccupied {
         ptr: Pointer,
         range: Range<u32>,
@@ -157,48 +159,44 @@ pub enum Error {
         ptr: Pointer,
         range: Range<u32>,
     },
-    SharedWriteInvalid {
-        ptr: Pointer,
-        range: Range<u32>,
-    },
     ReborrowSubset {
         ptr: Pointer,
         source: Pointer,
         source_range: Range<u32>,
     },
-    InvalidateNoWriteFailed {
-        ptr: Pointer,
-        range: Range<u32>,
-    },
 }
 
-impl Default for MemoryBlock {
+impl<D: Metadata> Default for MemoryBlock<D> {
     fn default() -> Self { Self::new() }
 }
 
-impl MemoryBlock {
+impl<D: Metadata> MemoryBlock<D> {
     pub fn new() -> Self {
         Self {
             memory: <_>::with_size(0),
             ptr_info: FxHashMap::default(),
             allocations: Slab::new(),
+            deallocated: FxHashSet::default(),
             vec_recycler: Recycler::new(),
         }
     }
 }
-impl<M: PointerMap> MemoryBlock<M> {
+impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
     pub fn with_size(size: u32) -> Self {
         Self {
             memory: M::with_size(size),
             ptr_info: FxHashMap::default(),
             allocations: Slab::new(),
+            deallocated: FxHashSet::default(),
             vec_recycler: Recycler::new(),
         }
     }
 
     fn size(&self) -> Option<u32> { self.memory.size() }
 
-    pub fn info(&self, ptr: Pointer) -> &PointerInfo { &self.ptr_info[&ptr] }
+    pub fn info(&self, ptr: Pointer) -> Option<&PointerInfo<D>> { self.ptr_info.get(&ptr) }
+
+    pub fn is_deallocated(&self, ptr: Pointer) -> bool { self.deallocated.contains(&ptr) }
 
     pub fn recylcer(&mut self) -> &mut Recycler<Vec<Pointer>> { &mut self.vec_recycler }
 
@@ -221,12 +219,9 @@ impl<M: PointerMap> MemoryBlock<M> {
         match self.ptr_info.entry(ptr) {
             Entry::Vacant(entry) => {
                 entry.insert(PointerInfo {
-                    meta: Meta {
-                        range: range.clone(),
-                        ptr_ty: PtrType::Exclusive,
-                        read: true,
-                        write: true,
-                    },
+                    meta: Metadata::alloc(),
+                    range: range.clone(),
+                    ptr_ty: PtrType::Exclusive,
                     owns_allocation: true,
                     alloc_id: u32::try_from(self.allocations.insert(self.vec_recycler.take())).unwrap(),
                 });
@@ -244,34 +239,95 @@ impl<M: PointerMap> MemoryBlock<M> {
         OK
     }
 
-    pub fn reborrow(&mut self, ptr: Pointer, source: Pointer, meta: Meta) -> Result {
-        let source_info = &self.ptr_info[&source];
+    pub fn reborrow_shared(&mut self, ptr: Pointer, source: Pointer, range: Range<u32>, meta: D) -> Result {
+        let mut filter = D::filter_all();
+        let filter = &mut filter;
 
-        if !(source_info.meta.range.start <= meta.range.start && meta.range.end <= source_info.meta.range.end) {
+        let source_range = self.reborrow_common(ptr, source, PtrType::Shared, range.clone(), meta, filter)?;
+
+        let ptr_info = &self.ptr_info;
+        self.memory.for_each(range, &mut self.vec_recycler, |byte| {
+            let pos = 1 + byte
+                .iter()
+                .rposition(|ptr| *ptr == source)
+                .ok_or(Error::ReborrowSubset {
+                    ptr,
+                    source,
+                    source_range: source_range.clone(),
+                })?;
+
+            let offset = byte[pos..].iter().position(|ptr| {
+                let info = &ptr_info[ptr];
+                info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
+            });
+            if let Some(offset) = offset {
+                byte.truncate(pos + offset);
+            }
+            byte.push(ptr);
+            Ok(false)
+        })
+    }
+
+    pub fn reborrow_exclusive(&mut self, ptr: Pointer, source: Pointer, range: Range<u32>, meta: D) -> Result {
+        let mut filter = D::filter_all();
+        let filter = &mut filter;
+
+        let source_range = self.reborrow_common(ptr, source, PtrType::Exclusive, range.clone(), meta, filter)?;
+
+        self.memory.for_each(range, &mut self.vec_recycler, |byte| {
+            let pos = 1 + byte
+                .iter()
+                .rposition(|ptr| *ptr == source)
+                .ok_or(Error::ReborrowSubset {
+                    ptr,
+                    source,
+                    source_range: source_range.clone(),
+                })?;
+            byte.truncate(pos);
+            byte.push(ptr);
+            Ok(false)
+        })
+    }
+
+    fn reborrow_common(
+        &mut self,
+        ptr: Pointer,
+        source: Pointer,
+        ptr_ty: PtrType,
+        range: Range<u32>,
+        meta: D,
+        filter: &mut D::Filter,
+    ) -> Result<Range<u32>> {
+        let source_info = self.ptr_info.get(&source).ok_or(Error::InvalidPtr(source))?;
+
+        if !(source_info.range.start <= range.start && range.end <= source_info.range.end) {
             return Err(Error::ReborrowSubset {
                 ptr,
                 source,
-                source_range: source_info.meta.range.clone(),
+                source_range: source_info.range.clone(),
             })
         }
 
-        if u8::from(source_info.meta.read) < u8::from(meta.read) {
-            return Err(Error::ReborrowReadPermission)
+        if meta.does_invalidate(source_info.meta, filter) {
+            return Err(Error::ReborrowInvalidatesSource)
         }
 
-        if u8::from(source_info.meta.write) < u8::from(meta.write) {
-            return Err(Error::ReborrowWritePermission)
+        if self.deallocated.contains(&ptr) {
+            return Err(Error::UseAfterFree(ptr))
         }
 
-        let source_range = source_info.meta.range.clone();
+        let source_range = source_info.range.clone();
         let alloc_id = source_info.alloc_id;
 
+        self.allocations[alloc_id as usize].push(ptr);
         match self.ptr_info.entry(ptr) {
             Entry::Vacant(entry) => {
                 entry.insert(PointerInfo {
-                    meta: meta.clone(),
+                    range,
                     owns_allocation: false,
                     alloc_id,
+                    ptr_ty,
+                    meta,
                 });
             }
             Entry::Occupied(_) => {
@@ -279,50 +335,15 @@ impl<M: PointerMap> MemoryBlock<M> {
             }
         }
 
-        let ptr_info = &self.ptr_info;
-        match meta.ptr_ty {
-            PtrType::Shared => self
-                .memory
-                .for_each(meta.range.clone(), &mut self.vec_recycler, |byte| {
-                    let pos = 1 + byte
-                        .iter()
-                        .rposition(|ptr| *ptr == source)
-                        .ok_or(Error::ReborrowSubset {
-                            ptr,
-                            source,
-                            source_range: source_range.clone(),
-                        })?;
-
-                    let offset = byte[pos..].iter().position(|ptr| {
-                        let byte_meta = &ptr_info[ptr].meta;
-                        u8::from(byte_meta.write) < u8::from(meta.write)
-                            || u8::from(byte_meta.read) < u8::from(meta.read)
-                            || byte_meta.ptr_ty == PtrType::Exclusive
-                    });
-                    if let Some(offset) = offset {
-                        byte.truncate(pos + offset);
-                    }
-                    byte.push(ptr);
-                    Ok(false)
-                }),
-            PtrType::Exclusive => self.memory.for_each(meta.range, &mut self.vec_recycler, |byte| {
-                let pos = 1 + byte
-                    .iter()
-                    .rposition(|ptr| *ptr == source)
-                    .ok_or(Error::ReborrowSubset {
-                        ptr,
-                        source,
-                        source_range: source_range.clone(),
-                    })?;
-                byte.truncate(pos);
-                byte.push(ptr);
-                Ok(false)
-            }),
-        }
+        Ok(source_range)
     }
 
     pub fn deallocate(&mut self, ptr: Pointer) -> Result {
-        if !self.ptr_info[&ptr].owns_allocation {
+        if self.deallocated.contains(&ptr) {
+            return Err(Error::UseAfterFree(ptr))
+        }
+
+        if !self.ptr_info.get(&ptr).ok_or(Error::InvalidPtr(ptr))?.owns_allocation {
             return Err(Error::DeallocateNonOwning(ptr))
         }
 
@@ -332,110 +353,85 @@ impl<M: PointerMap> MemoryBlock<M> {
         let mut allocation = self.allocations.remove(info.alloc_id as usize);
         for ptr in allocation.drain(..) {
             self.ptr_info.remove(&ptr);
+            self.deallocated.insert(ptr);
         }
         self.vec_recycler.put(allocation);
 
         OK
     }
 
-    pub fn downgrade(&mut self, ptr: Pointer) -> Result {
-        let info = self.ptr_info.get_mut(&ptr).unwrap();
-
-        if info.meta.ptr_ty != PtrType::Exclusive {
-            return Err(Error::NotExclusive(ptr))
+    pub fn mark_shared(&mut self, ptr: Pointer) -> Result {
+        if self.deallocated.contains(&ptr) {
+            return Err(Error::UseAfterFree(ptr))
         }
-
-        info.meta.ptr_ty = PtrType::Shared;
+        let info = self.ptr_info.get_mut(&ptr).unwrap();
+        info.ptr_ty = PtrType::Shared;
+        self.assert_shared(ptr, D::filter_all())?;
         OK
     }
 
-    pub fn assert_exclusive(&mut self, ptr: Pointer) -> Result { self.assert_exclusive_inner(ptr, true) }
-
-    fn assert_exclusive_inner(&mut self, ptr: Pointer, keep: bool) -> Result {
-        let info = &self.ptr_info[&ptr];
-
-        if info.meta.ptr_ty != PtrType::Exclusive {
-            return Err(Error::NotExclusive(ptr))
+    pub fn mark_exclusive(&mut self, ptr: Pointer) -> Result {
+        if self.deallocated.contains(&ptr) {
+            return Err(Error::UseAfterFree(ptr))
         }
-
-        self.memory
-            .for_each(info.meta.range.clone(), &mut self.vec_recycler, |byte| {
-                let pos = byte
-                    .iter()
-                    .rposition(|packed_ptr| *packed_ptr == ptr)
-                    .ok_or(Error::InvalidForRange {
-                        ptr,
-                        range: info.meta.range.clone(),
-                    })?;
-                byte.truncate(pos + usize::from(keep));
-                Ok(!keep && byte.is_empty())
-            })
+        let info = self.ptr_info.get_mut(&ptr).unwrap();
+        info.ptr_ty = PtrType::Exclusive;
+        self.assert_exclusive(ptr)?;
+        OK
     }
 
-    pub fn assert_shared(&mut self, ptr: Pointer) -> Result { self.assert_shared_inner(ptr, true) }
-
-    pub fn assert_shared_inner(&mut self, ptr: Pointer, is_read: bool) -> Result {
+    pub fn assert_shared(&mut self, ptr: Pointer, mut filter: D::Filter) -> Result {
+        if self.deallocated.contains(&ptr) {
+            return Err(Error::UseAfterFree(ptr))
+        }
+        let filter = &mut filter;
         let ptr_info = &self.ptr_info;
-        let info = &ptr_info[&ptr];
-        let ptr_meta = info.meta.clone();
+        let info = ptr_info.get(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let meta = info.meta;
 
         self.memory
-            .for_each(info.meta.range.clone(), &mut self.vec_recycler, |byte| {
-                let pos = byte
+            .for_each(info.range.clone(), &mut self.vec_recycler, |byte| {
+                let pos = 1 + byte
                     .iter()
                     .rposition(|packed_ptr| *packed_ptr == ptr)
                     .ok_or(Error::InvalidForRange {
                         ptr,
-                        range: info.meta.range.clone(),
+                        range: info.range.clone(),
                     })?;
-                let offset = byte.iter().skip(pos + 1).position(|packed_ptr| {
-                    let meta = &ptr_info[packed_ptr].meta;
-                    meta.ptr_ty == PtrType::Exclusive
-                        || u8::from(meta.read) < u8::from(ptr_meta.read)
-                        || u8::from(meta.write || is_read) < u8::from(ptr_meta.write)
+                let offset = byte[pos..].iter().position(|packed_ptr| {
+                    let info = &ptr_info[packed_ptr];
+                    info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
                 });
                 if let Some(offset) = offset {
-                    byte.truncate(pos + 1 + offset);
+                    byte.truncate(pos + offset);
                 }
                 Ok(false)
             })
     }
 
-    pub fn read(&mut self, ptr: Pointer) -> Result {
-        let info = &self.ptr_info[&ptr];
-        if !info.meta.read {
-            return Err(Error::ReadInvalid(ptr))
+    pub fn assert_exclusive(&mut self, ptr: Pointer) -> Result { self.assert_exclusive_inner(ptr, true) }
+
+    fn assert_exclusive_inner(&mut self, ptr: Pointer, keep: bool) -> Result {
+        if self.deallocated.contains(&ptr) {
+            return Err(Error::UseAfterFree(ptr))
         }
 
-        self.assert_shared(ptr)
-    }
-
-    pub fn shared_write(&mut self, ptr: Pointer) -> Result {
-        let info = &self.ptr_info[&ptr];
-        if !info.meta.write {
-            return Err(Error::WriteInvalid(ptr))
+        let info = self.ptr_info.get(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        if info.ptr_ty != PtrType::Exclusive {
+            return Err(Error::NotExclusive(ptr))
         }
 
-        self.assert_shared_inner(ptr, false)
-    }
-
-    pub fn exclusive_write(&mut self, ptr: Pointer) -> Result {
-        let info = &self.ptr_info[&ptr];
-
-        if !info.meta.write {
-            return Err(Error::WriteInvalid(ptr))
-        }
-
-        self.assert_exclusive(ptr)
-    }
-}
-
-impl fmt::Debug for MemoryBlock {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "MemoryBlock {{ memory: {:?}, ptr_info: {:#?} }}",
-            self.memory, self.ptr_info,
-        )
+        self.memory
+            .for_each(info.range.clone(), &mut self.vec_recycler, |byte| {
+                let pos = byte
+                    .iter()
+                    .rposition(|packed_ptr| *packed_ptr == ptr)
+                    .ok_or(Error::InvalidForRange {
+                        ptr,
+                        range: info.range.clone(),
+                    })?;
+                byte.truncate(pos + usize::from(keep));
+                Ok(!keep && byte.is_empty())
+            })
     }
 }
