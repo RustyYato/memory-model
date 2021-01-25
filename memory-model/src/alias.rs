@@ -1,6 +1,7 @@
 use std::{
     collections::{btree_map::Entry as BEntry, hash_map::Entry, BTreeMap, HashMap},
-    convert::{Infallible, TryFrom},
+    convert::TryFrom,
+    fmt,
     hash::BuildHasher,
     ops::Range,
 };
@@ -8,22 +9,33 @@ use std::{
 use fxhash::{FxHashMap, FxHashSet};
 use slab::Slab;
 
-use crate::{recycle::Recycler, Pointer};
+use crate::{
+    recycle::{Recycle, Recycler},
+    Pointer,
+};
+
+macro_rules! check_dealloc {
+    ($self:ident, $ptr:expr) => {
+        if $self.is_deallocated($ptr) {
+            return Err(Error::UseAfterFree($ptr))
+        }
+    };
+}
 
 pub trait PointerMap {
     fn with_size(size: u32) -> Self;
 
     fn size(&self) -> Option<u32>;
 
-    fn for_each<E, F: FnMut(&mut Vec<Pointer>) -> Result<bool, E>>(
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
         &mut self,
         range: Range<u32>,
-        recycler: &mut Recycler<Vec<Pointer>>,
+        recycler: &mut Recycler<Stack>,
         f: F,
     ) -> Result<(), E>;
 }
 
-pub trait Metadata: Copy + Eq {
+pub trait Metadata: Copy + Eq + fmt::Debug {
     type Filter;
 
     fn alloc() -> Self;
@@ -33,15 +45,15 @@ pub trait Metadata: Copy + Eq {
     fn does_invalidate(self, other: Self, filter: &mut Self::Filter) -> bool;
 }
 
-impl PointerMap for Vec<Vec<Pointer>> {
-    fn with_size(size: u32) -> Self { (0..size).map(|_| Vec::new()).collect() }
+impl PointerMap for Vec<Stack> {
+    fn with_size(size: u32) -> Self { (0..size).map(|_| Stack::default()).collect() }
 
     fn size(&self) -> Option<u32> { Some(self.len() as u32) }
 
-    fn for_each<E, F: FnMut(&mut Vec<Pointer>) -> Result<bool, E>>(
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
         &mut self,
         range: Range<u32>,
-        _: &mut Recycler<Vec<Pointer>>,
+        _: &mut Recycler<Stack>,
         mut f: F,
     ) -> Result<(), E> {
         let range = range.start as usize..range.end as usize;
@@ -52,15 +64,15 @@ impl PointerMap for Vec<Vec<Pointer>> {
     }
 }
 
-impl<B: Default + BuildHasher> PointerMap for HashMap<u32, Vec<Pointer>, B> {
+impl<B: Default + BuildHasher> PointerMap for HashMap<u32, Stack, B> {
     fn with_size(_: u32) -> Self { Self::default() }
 
     fn size(&self) -> Option<u32> { None }
 
-    fn for_each<E, F: FnMut(&mut Vec<Pointer>) -> Result<bool, E>>(
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
         &mut self,
         range: Range<u32>,
-        recycler: &mut Recycler<Vec<Pointer>>,
+        recycler: &mut Recycler<Stack>,
         mut f: F,
     ) -> Result<(), E> {
         for i in range {
@@ -84,15 +96,15 @@ impl<B: Default + BuildHasher> PointerMap for HashMap<u32, Vec<Pointer>, B> {
     }
 }
 
-impl PointerMap for BTreeMap<u32, Vec<Pointer>> {
+impl PointerMap for BTreeMap<u32, Stack> {
     fn with_size(_: u32) -> Self { Self::default() }
 
     fn size(&self) -> Option<u32> { None }
 
-    fn for_each<E, F: FnMut(&mut Vec<Pointer>) -> Result<bool, E>>(
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
         &mut self,
         range: Range<u32>,
-        recycler: &mut Recycler<Vec<Pointer>>,
+        recycler: &mut Recycler<Stack>,
         mut f: F,
     ) -> Result<(), E> {
         for i in range {
@@ -116,24 +128,43 @@ impl PointerMap for BTreeMap<u32, Vec<Pointer>> {
     }
 }
 
+#[derive(Default, Debug)]
+pub struct Stack(Vec<u32>);
+
+impl Recycle for Stack {
+    type Size = usize;
+
+    fn empty(mut self) -> Self {
+        self.0.clear();
+        self
+    }
+
+    fn size(&self) -> Self::Size { self.0.capacity() }
+}
+
 #[derive(Debug)]
-pub struct MemoryBlock<D, M = BTreeMap<u32, Vec<Pointer>>> {
+pub struct MemoryBlock<D, M = BTreeMap<u32, Stack>> {
     memory: M,
-    ptr_info: FxHashMap<Pointer, PointerInfo<D>>,
     deallocated: FxHashSet<Pointer>,
     allocations: Slab<Vec<Pointer>>,
-    copies: Slab<u32>,
+    stack_recycler: Recycler<Stack>,
     vec_recycler: Recycler<Vec<Pointer>>,
+    store: PointerStore<D>,
+}
+
+struct PointerStore<D> {
+    ptr_info: Slab<PointerInfo<D>>,
+    counters: FxHashMap<Pointer, u32>,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PointerInfo<D> {
+    copies: u32,
     pub range: Range<u32>,
     pub ptr_ty: PtrType,
     pub owns_allocation: bool,
     pub alloc_id: u32,
-    pub copy_id: u32,
     pub meta: D,
 }
 
@@ -170,6 +201,54 @@ pub enum Error {
     },
 }
 
+impl<D: Copy + fmt::Debug> PointerStore<D> {
+    fn new() -> Self {
+        Self {
+            counters: Default::default(),
+            ptr_info: Default::default(),
+        }
+    }
+
+    fn alloc(&mut self, ptr: Pointer, info: PointerInfo<D>) -> u32 {
+        let id = u32::try_from(self.ptr_info.insert(info)).expect("Tried to create too many pointers");
+        self.counters.insert(ptr, id);
+        id
+    }
+
+    fn drop(&mut self, ptr: Pointer) -> Result<Option<PointerInfo<D>>> {
+        let id = self.counters.remove(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let info = &mut self.ptr_info[id as usize];
+        info.copies -= 1;
+        if info.copies == 0 {
+            Ok(Some(self.ptr_info.remove(id as usize)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn make_exclusive(&mut self, ptr: Pointer) -> Result<(u32, u32, &mut PointerInfo<D>)> {
+        let id = self.counters.get_mut(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let info = &mut self.ptr_info[*id as usize];
+        let old_id = *id;
+        if info.copies != 1 {
+            info.copies -= 1;
+            let info = info.clone();
+            *id = u32::try_from(self.ptr_info.insert(info)).expect("Tried to create too many pointers");
+        }
+        Ok((old_id, *id, &mut self.ptr_info[*id as usize]))
+    }
+
+    fn get(&self, ptr: Pointer) -> Option<(u32, &PointerInfo<D>)> {
+        let id = *self.counters.get(&ptr)?;
+        Some((id, &self.ptr_info[id as usize]))
+    }
+
+    fn get_mut(&mut self, ptr: Pointer) -> Option<(u32, &mut PointerInfo<D>)> {
+        let id = *self.counters.get(&ptr)?;
+        Some((id, &mut self.ptr_info[id as usize]))
+    }
+}
+
 impl<D: Metadata> Default for MemoryBlock<D> {
     fn default() -> Self { Self::new() }
 }
@@ -182,126 +261,52 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
     pub fn with_size(size: u32) -> Self {
         Self {
             memory: M::with_size(size),
-            ptr_info: FxHashMap::default(),
+            store: PointerStore::new(),
             allocations: Slab::new(),
             deallocated: FxHashSet::default(),
+            stack_recycler: Recycler::new(),
             vec_recycler: Recycler::new(),
-            copies: Slab::new(),
         }
     }
 
-    fn size(&self) -> Option<u32> { self.memory.size() }
-
-    pub fn info(&self, ptr: Pointer) -> Option<&PointerInfo<D>> { self.ptr_info.get(&ptr) }
-
-    pub fn update_meta(&mut self, ptr: Pointer, f: impl FnOnce(D) -> D) -> Result {
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
-        }
-
-        let info = self.ptr_info.get_mut(&ptr).ok_or(Error::InvalidPtr(ptr))?;
-        let old_meta = info.meta;
-        let meta = f(info.meta);
-        if meta.does_invalidate(old_meta, &mut D::filter_all()) {
-            return Err(Error::InvalidatesOldMeta(ptr))
-        }
-        info.meta = meta;
-        if old_meta.does_invalidate(meta, &mut D::filter_all()) {
-            let copy_id = info.copy_id;
-            let range = info.range.clone();
-            self.copies[copy_id as usize] -= 1;
-            info.copy_id = self.copies.insert(1) as u32;
-            let ptr_info = &self.ptr_info;
-            self.memory.for_each(range.clone(), &mut self.vec_recycler, |byte| {
-                let (pos, _, copy_block_end) = search(ptr, copy_id, byte, &range, ptr_info)?;
-                let copy_block_end = copy_block_end();
-                byte.swap(pos, copy_block_end);
-                Ok(false)
-            })?
-        }
-
-        OK
-    }
+    pub fn info(&self, ptr: Pointer) -> Option<&PointerInfo<D>> { self.store.get(ptr).map(|(_, info)| info) }
 
     pub fn is_deallocated(&self, ptr: Pointer) -> bool { self.deallocated.contains(&ptr) }
 
-    pub fn recylcer(&mut self) -> &mut Recycler<Vec<Pointer>> { &mut self.vec_recycler }
+    pub fn recylcer(&mut self) -> &mut Recycler<Stack> { &mut self.stack_recycler }
 
     pub fn allocate(&mut self, ptr: Pointer, range: Range<u32>) -> Result {
-        if let Some(size) = self.size() {
-            assert!(range.end <= size);
+        check_dealloc!(self, ptr);
+        if self.store.counters.contains_key(&ptr) {
+            panic!("Could not allocate already tracked pointer")
         }
 
-        self.memory.for_each(range.clone(), &mut self.vec_recycler, |byte| {
-            if byte.is_empty() {
-                Ok(false)
-            } else {
-                Err(Error::AllocateRangeOccupied {
-                    ptr,
-                    range: range.clone(),
-                })
-            }
-        })?;
+        self.memory
+            .for_each(range.clone(), &mut self.stack_recycler, |Stack(byte)| {
+                if byte.is_empty() {
+                    Ok(false)
+                } else {
+                    Err(Error::AllocateRangeOccupied {
+                        ptr,
+                        range: range.clone(),
+                    })
+                }
+            })?;
 
-        match self.ptr_info.entry(ptr) {
-            Entry::Vacant(entry) => {
-                entry.insert(PointerInfo {
-                    meta: Metadata::alloc(),
-                    range: range.clone(),
-                    ptr_ty: PtrType::Exclusive,
-                    owns_allocation: true,
-                    alloc_id: u32::try_from(self.allocations.insert(self.vec_recycler.take())).unwrap(),
-                    copy_id: self.copies.insert(1) as u32,
-                });
-            }
-            Entry::Occupied(_) => {
-                panic!("Could not allocate tracked pointer")
-            }
-        }
+        let alloc_id = u32::try_from(self.allocations.insert(self.vec_recycler.take()))
+            .expect("Tried to create too many allocations");
 
-        let _ = self.memory.for_each(range, &mut self.vec_recycler, |byte| {
-            byte.push(ptr);
-            Ok::<_, Infallible>(false)
+        let id = self.store.alloc(ptr, PointerInfo {
+            alloc_id,
+            copies: 1,
+            owns_allocation: true,
+            meta: D::alloc(),
+            ptr_ty: PtrType::Exclusive,
+            range: range.clone(),
         });
 
-        OK
-    }
-
-    pub fn reborrow_shared(&mut self, ptr: Pointer, source: Pointer, range: Range<u32>, meta: D) -> Result {
-        let mut filter = D::filter_all();
-        let filter = &mut filter;
-
-        let source_range = self.reborrow_common(ptr, source, PtrType::Shared, range.clone(), meta, filter)?;
-
-        let ptr_info = &self.ptr_info;
-        let copy_id = ptr_info[&source].copy_id;
-        self.memory.for_each(range, &mut self.vec_recycler, |byte| {
-            let (pos, _, _) = search(source, copy_id, byte, &source_range, ptr_info)?;
-            let pos = pos + 1;
-            let offset = byte[pos..].iter().position(|ptr| {
-                let info = &ptr_info[ptr];
-                info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
-            });
-            if let Some(offset) = offset {
-                byte.truncate(pos + offset);
-            }
-            byte.push(ptr);
-            Ok(false)
-        })
-    }
-
-    pub fn reborrow_exclusive(&mut self, ptr: Pointer, source: Pointer, range: Range<u32>, meta: D) -> Result {
-        let mut filter = D::filter_all();
-        let filter = &mut filter;
-
-        let source_range = self.reborrow_common(ptr, source, PtrType::Exclusive, range.clone(), meta, filter)?;
-
-        let ptr_info = &self.ptr_info;
-        let copy_id = ptr_info[&source].copy_id;
-        self.memory.for_each(range, &mut self.vec_recycler, |byte| {
-            let (pos, _, _) = search(source, copy_id, byte, &source_range, ptr_info)?;
-            byte.truncate(pos + 1);
-            byte.push(ptr);
+        self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
+            byte.push(id);
             Ok(false)
         })
     }
@@ -313,9 +318,15 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         ptr_ty: PtrType,
         range: Range<u32>,
         meta: D,
-        filter: &mut D::Filter,
-    ) -> Result<Range<u32>> {
-        let source_info = self.ptr_info.get(&source).ok_or(Error::InvalidPtr(source))?;
+    ) -> Result<(u32, u32, Range<u32>)> {
+        check_dealloc!(self, source);
+        check_dealloc!(self, ptr);
+
+        if self.store.counters.contains_key(&ptr) {
+            panic!("Could not allocate already tracked pointer")
+        }
+
+        let (source_id, source_info) = self.store.get(source).ok_or(Error::InvalidPtr(source))?;
 
         if !(source_info.range.start <= range.start && range.end <= source_info.range.end) {
             return Err(Error::ReborrowSubset {
@@ -325,205 +336,221 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             })
         }
 
-        if meta.does_invalidate(source_info.meta, filter) {
+        if meta.does_invalidate(source_info.meta, &mut D::filter_all()) {
             return Err(Error::ReborrowInvalidatesSource)
-        }
-
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
         }
 
         let source_range = source_info.range.clone();
         let alloc_id = source_info.alloc_id;
 
         self.allocations[alloc_id as usize].push(ptr);
-        match self.ptr_info.entry(ptr) {
-            Entry::Vacant(entry) => {
-                entry.insert(PointerInfo {
-                    range,
-                    owns_allocation: false,
-                    alloc_id,
-                    ptr_ty,
-                    meta,
-                    copy_id: self.copies.insert(1) as u32,
-                });
-            }
-            Entry::Occupied(_) => {
-                panic!("Could not reborrow already-borrowed pointer")
-            }
-        }
+        let id = self.store.alloc(ptr, PointerInfo {
+            owns_allocation: false,
+            copies: 1,
+            alloc_id,
+            ptr_ty,
+            range,
+            meta,
+        });
 
-        Ok(source_range)
+        Ok((id, source_id, source_range))
     }
 
-    pub fn copy(&mut self, ptr: Pointer, source: Pointer) -> Result {
-        if self.deallocated.contains(&source) {
-            return Err(Error::UseAfterFree(source))
-        }
+    pub fn reborrow_exclusive(&mut self, ptr: Pointer, source: Pointer, range: Range<u32>, meta: D) -> Result {
+        let (id, _source_id, source_range) =
+            self.reborrow_common(ptr, source, PtrType::Exclusive, range.clone(), meta)?;
 
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
-        }
-
-        let source_info = self.ptr_info.get(&source).ok_or(Error::InvalidPtr(source))?;
-
-        if source_info.ptr_ty != PtrType::Shared {
-            return Err(Error::NotShared(source))
-        }
-
-        let info = source_info.clone();
-        self.allocations[info.alloc_id as usize].push(ptr);
-        let info = match self.ptr_info.entry(ptr) {
-            Entry::Vacant(entry) => entry.insert(info),
-            Entry::Occupied(_) => panic!(""),
-        };
-
-        self.copies[info.copy_id as usize] += 1;
-
-        let range = info.range.clone();
-        let ptr_info = &self.ptr_info;
-        let copy_id = ptr_info[&source].copy_id;
-        self.memory.for_each(range.clone(), &mut self.vec_recycler, |byte| {
-            let (pos, _, _) = search(source, copy_id, byte, &range, ptr_info)?;
-            byte.insert(pos, ptr);
+        self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
+            let pos = 1 + search(source, id, byte, &source_range)?;
+            byte.truncate(pos);
+            byte.push(id);
             Ok(false)
         })
     }
 
-    pub fn deallocate(&mut self, ptr: Pointer) -> Result {
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
+    pub fn reborrow_shared(&mut self, ptr: Pointer, source: Pointer, range: Range<u32>, meta: D) -> Result {
+        let (id, source_id, source_range) = self.reborrow_common(ptr, source, PtrType::Shared, range.clone(), meta)?;
+        let ptr_info = &self.store.ptr_info;
+        let mut filter = D::filter_all();
+
+        self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
+            let pos = 1 + search(source, source_id, byte, &source_range)?;
+
+            let offset = byte[pos..].iter().position(|&id| {
+                let info = &ptr_info[id as usize];
+                info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, &mut filter)
+            });
+
+            if let Some(offset) = offset {
+                byte.truncate(pos + offset);
+            }
+
+            byte.push(id);
+            Ok(false)
+        })
+    }
+
+    pub fn update_meta(&mut self, ptr: Pointer, f: impl FnOnce(D) -> D) -> Result {
+        check_dealloc!(self, ptr);
+
+        let (id, info) = self.store.get_mut(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let old_meta = info.meta;
+        let meta = f(info.meta);
+
+        if meta.does_invalidate(old_meta, &mut D::filter_all()) {
+            return Err(Error::InvalidatesOldMeta(ptr))
         }
 
-        if !self.ptr_info.get(&ptr).ok_or(Error::InvalidPtr(ptr))?.owns_allocation {
+        info.meta = meta;
+
+        if info.copies != 1 && old_meta.does_invalidate(meta, &mut D::filter_all()) {
+            info.copies -= 1;
+            let mut info = info.clone();
+            info.copies = 1;
+            let range = info.range.clone();
+            let new_id = self.store.alloc(ptr, info);
+
+            self.memory
+                .for_each(range.clone(), &mut self.stack_recycler, |Stack(byte)| {
+                    let pos = search(ptr, id, byte, &range)?;
+                    byte.insert(pos + 1, new_id);
+                    Ok(false)
+                })?
+        }
+
+        OK
+    }
+
+    pub fn copy(&mut self, ptr: Pointer, source: Pointer) -> Result {
+        check_dealloc!(self, source);
+        check_dealloc!(self, ptr);
+
+        let (id, info) = self.store.get_mut(source).ok_or(Error::InvalidPtr(source))?;
+
+        if info.ptr_ty != PtrType::Shared {
+            return Err(Error::NotShared(source))
+        }
+
+        info.copies += 1;
+        self.allocations[info.alloc_id as usize].push(ptr);
+        self.store.counters.insert(ptr, id);
+
+        OK
+    }
+
+    pub fn deallocate(&mut self, ptr: Pointer) -> Result {
+        check_dealloc!(self, ptr);
+
+        if !self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?.1.owns_allocation {
             return Err(Error::DeallocateNonOwning(ptr))
         }
 
         self.assert_exclusive_inner(ptr, false)?;
 
-        let info = self.ptr_info.remove(&ptr).ok_or(Error::InvalidPtr(ptr))?;
-
-        let copies = &mut self.copies[info.copy_id as usize];
-        *copies -= 1;
-        if *copies == 0 {
-            self.copies.remove(info.copy_id as usize);
-        }
-
+        let info = self.store.drop(ptr)?.unwrap();
         self.deallocated.insert(ptr);
         let mut allocation = self.allocations.remove(info.alloc_id as usize);
+
         for ptr in allocation.drain(..) {
-            if let Some(info) = self.ptr_info.remove(&ptr) {
-                let copies = &mut self.copies[info.copy_id as usize];
-                *copies -= 1;
-                if *copies == 0 {
-                    self.copies.remove(info.copy_id as usize);
-                }
-            }
+            let _ = self.store.drop(ptr);
             self.deallocated.insert(ptr);
         }
+
         self.vec_recycler.put(allocation);
 
         OK
     }
 
+    pub fn mark_exclusive(&mut self, ptr: Pointer) -> Result {
+        check_dealloc!(self, ptr);
+        let (old_id, id, info) = self.store.make_exclusive(ptr)?;
+        info.ptr_ty = PtrType::Exclusive;
+        let info = &self.store.ptr_info[id as usize];
+        self.memory
+            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
+                let pos = search(ptr, old_id, byte, &info.range)?;
+                byte.truncate(pos);
+                byte.push(id);
+                Ok(false)
+            })
+    }
+
     pub fn mark_shared(&mut self, ptr: Pointer) -> Result {
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
-        }
-        let info = self.ptr_info.get_mut(&ptr).unwrap();
+        check_dealloc!(self, ptr);
+        let (_, info) = self.store.get_mut(ptr).unwrap();
         info.ptr_ty = PtrType::Shared;
         self.assert_shared(ptr, D::filter_all())?;
         OK
     }
 
-    pub fn mark_exclusive(&mut self, ptr: Pointer) -> Result {
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
-        }
-        let info = self.ptr_info.get_mut(&ptr).ok_or(Error::InvalidPtr(ptr))?;
-
-        info.ptr_ty = PtrType::Exclusive;
-        self.assert_exclusive(ptr)?;
-        OK
-    }
+    pub fn assert_exclusive(&mut self, ptr: Pointer) -> Result { self.assert_exclusive_inner(ptr, true) }
 
     pub fn assert_shared(&mut self, ptr: Pointer, mut filter: D::Filter) -> Result {
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
-        }
+        check_dealloc!(self, ptr);
+
         let filter = &mut filter;
-        let ptr_info = &self.ptr_info;
-        let info = ptr_info.get(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let ptr_info = &self.store.ptr_info;
         let meta = info.meta;
 
-        let copy_id = ptr_info[&ptr].copy_id;
         self.memory
-            .for_each(info.range.clone(), &mut self.vec_recycler, |byte| {
-                let (pos, _, _) = search(ptr, copy_id, byte, &info.range, ptr_info)?;
-                let pos = pos + 1;
-                let offset = byte[pos..].iter().position(|packed_ptr| {
-                    let info = &ptr_info[packed_ptr];
+            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
+                let pos = 1 + search(ptr, id, byte, &info.range)?;
+                let offset = byte[pos..].iter().position(|&id| {
+                    let info = &ptr_info[id as usize];
                     info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
                 });
+
                 if let Some(offset) = offset {
                     byte.truncate(pos + offset);
                 }
+
                 Ok(false)
             })
     }
 
-    pub fn assert_exclusive(&mut self, ptr: Pointer) -> Result { self.assert_exclusive_inner(ptr, true) }
-
     fn assert_exclusive_inner(&mut self, ptr: Pointer, keep: bool) -> Result {
-        if self.deallocated.contains(&ptr) {
-            return Err(Error::UseAfterFree(ptr))
-        }
+        check_dealloc!(self, ptr);
+        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
 
-        let info = self.ptr_info.get(&ptr).ok_or(Error::InvalidPtr(ptr))?;
         if info.ptr_ty != PtrType::Exclusive {
             return Err(Error::NotExclusive(ptr))
         }
 
-        let ptr_info = &self.ptr_info;
-        let copy_id = ptr_info[&ptr].copy_id;
         self.memory
-            .for_each(info.range.clone(), &mut self.vec_recycler, |byte| {
-                let (pos, copy_block_start, _) = search(ptr, copy_id, byte, &info.range, ptr_info)?;
-                let copy_block_start = copy_block_start();
-                byte.swap(pos, copy_block_start);
+            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
+                let pos = search(ptr, id, byte, &info.range)?;
                 byte.truncate(pos + usize::from(keep));
                 Ok(!keep && byte.is_empty())
             })
     }
 }
 
-fn search<'a, D: Metadata + 'a>(
-    ptr: Pointer,
-    copy_id: u32,
-    byte: &'a [Pointer],
-    range: &Range<u32>,
-    ptr_info: &'a FxHashMap<Pointer, PointerInfo<D>>,
-) -> Result<(usize, impl 'a + FnOnce() -> usize, impl 'a + FnOnce() -> usize)> {
-    let this_pos = byte
-        .iter()
-        .rposition(|byte| *byte == ptr)
+fn search(ptr: Pointer, ptr_id: u32, byte: &[u32], range: &Range<u32>) -> Result<usize> {
+    byte.iter()
+        .rposition(|byte| *byte == ptr_id)
         .ok_or(Error::InvalidForRange {
             ptr,
             range: range.clone(),
-        })?;
-    Ok((
-        this_pos,
-        move || {
-            byte[..=this_pos]
-                .iter()
-                .rposition(|ptr| ptr_info[ptr].copy_id != copy_id)
-                .map_or(0, |pos| pos + 1)
-        },
-        move || {
-            byte[this_pos..]
-                .iter()
-                .rposition(|ptr| ptr_info[ptr].copy_id != copy_id)
-                .unwrap_or(byte.len() - 1)
-        },
-    ))
+        })
+}
+
+impl<D: fmt::Debug> fmt::Debug for PointerStore<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut f = f.debug_map();
+
+        #[derive(Debug)]
+        struct Struct<A, B> {
+            copy_id: A,
+            info: B,
+        }
+
+        for (ptr, &id) in &self.counters {
+            f.entry(&ptr, &Struct {
+                copy_id: id,
+                info: &self.ptr_info[id as usize],
+            });
+        }
+        f.finish()
+    }
 }

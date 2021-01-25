@@ -144,11 +144,9 @@ fn main() {
             } => {
                 let ptr = allocator.ptr(name);
                 let res = if is_exclusive {
-                    model.mark_exclusive(ptr).and_then(|_| model.assert_exclusive(ptr))
+                    model.mark_exclusive(ptr)
                 } else {
-                    model
-                        .mark_shared(ptr)
-                        .and_then(|_| model.assert_shared(ptr, PermissionsFilter::Borrow))
+                    model.mark_shared(ptr)
                 };
                 res.unwrap();
                 model.update_meta(ptr, |_| Permissions { read, write }).unwrap();
@@ -184,6 +182,6 @@ fn main() {
             }
         }
 
-        // println!("{:?}\n\n", model);
+        // println!("{:#?}\n\n", model);
     }
 }
