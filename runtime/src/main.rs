@@ -268,7 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut allocator = Allocator::default();
-    let mut model = MemoryBlock::<_, FxHashMap<_, _>>::with_size(0);
+    let mut model = MemoryBlock::<_, memory_model::alias::HashPointerMap<fxhash::FxBuildHasher>>::with_size(0);
 
     for ast in ast {
         macro_rules! try_or_throw {

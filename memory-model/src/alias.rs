@@ -27,11 +27,9 @@ macro_rules! check_range {
         let ptr = $ptr;
         let (id, info) = $self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
         let range = $range.unwrap_or_else(|| info.range.clone());
-        $self
-            .memory
-            .for_each(range.clone(), &mut $self.stack_recycler, |Stack(byte)| {
-                search(ptr, id, byte, &range).map(|_| false)
-            })?
+        $self.memory.for_each(range.clone(), |Stack(byte)| {
+            search(ptr, id, byte, &range).map(|_| false)
+        })?
     }};
     ($self:expr, $ptr:expr) => {
         check_range!($self, $ptr, None)
@@ -43,12 +41,7 @@ pub trait PointerMap {
 
     fn size(&self) -> Option<u32>;
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
-        &mut self,
-        range: Range<u32>,
-        recycler: &mut Recycler<Stack>,
-        f: F,
-    ) -> Result<(), E>;
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, f: F) -> Result<(), E>;
 }
 
 pub trait Metadata: Copy + Eq {
@@ -61,6 +54,23 @@ pub trait Metadata: Copy + Eq {
     fn does_invalidate(self, other: Self, filter: &mut Self::Filter) -> bool;
 }
 
+#[derive(Debug)]
+pub struct FixedSizePointerMap {
+    inner: Vec<Stack>,
+}
+
+#[derive(Default, Debug)]
+pub struct HashPointerMap<B> {
+    inner: HashMap<u32, Stack, B>,
+    recycler: Recycler<Stack>,
+}
+
+#[derive(Default, Debug)]
+pub struct BTreePointerMap {
+    inner: BTreeMap<u32, Stack>,
+    recycler: Recycler<Stack>,
+}
+
 impl Metadata for () {
     type Filter = ();
 
@@ -71,40 +81,34 @@ impl Metadata for () {
     fn does_invalidate(self, (): Self, (): &mut Self::Filter) -> bool { false }
 }
 
-impl PointerMap for Vec<Stack> {
-    fn with_size(size: u32) -> Self { (0..size).map(|_| Stack::default()).collect() }
+impl PointerMap for FixedSizePointerMap {
+    fn with_size(size: u32) -> Self {
+        Self {
+            inner: (0..size).map(|_| Stack::default()).collect(),
+        }
+    }
 
-    fn size(&self) -> Option<u32> { Some(self.len() as u32) }
+    fn size(&self) -> Option<u32> { Some(self.inner.len() as u32) }
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
-        &mut self,
-        range: Range<u32>,
-        _: &mut Recycler<Stack>,
-        mut f: F,
-    ) -> Result<(), E> {
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, mut f: F) -> Result<(), E> {
         let range = range.start as usize..range.end as usize;
-        for byte in &mut self[range] {
+        for byte in &mut self.inner[range] {
             f(byte)?;
         }
         Ok(())
     }
 }
 
-impl<B: Default + BuildHasher> PointerMap for HashMap<u32, Stack, B> {
+impl<B: Default + BuildHasher> PointerMap for HashPointerMap<B> {
     fn with_size(_: u32) -> Self { Self::default() }
 
     fn size(&self) -> Option<u32> { None }
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
-        &mut self,
-        range: Range<u32>,
-        recycler: &mut Recycler<Stack>,
-        mut f: F,
-    ) -> Result<(), E> {
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, mut f: F) -> Result<(), E> {
         for i in range {
-            match self.entry(i) {
+            match self.inner.entry(i) {
                 Entry::Vacant(vacant) => {
-                    let mut vec = recycler.lease();
+                    let mut vec = self.recycler.lease();
                     let should_remove = f(&mut *vec)?;
                     if !should_remove {
                         vacant.insert(vec.take());
@@ -113,7 +117,7 @@ impl<B: Default + BuildHasher> PointerMap for HashMap<u32, Stack, B> {
                 Entry::Occupied(mut entry) => {
                     let should_remove = f(entry.get_mut())?;
                     if should_remove {
-                        recycler.put(entry.remove());
+                        self.recycler.put(entry.remove());
                     }
                 }
             }
@@ -122,21 +126,16 @@ impl<B: Default + BuildHasher> PointerMap for HashMap<u32, Stack, B> {
     }
 }
 
-impl PointerMap for BTreeMap<u32, Stack> {
+impl PointerMap for BTreePointerMap {
     fn with_size(_: u32) -> Self { Self::default() }
 
     fn size(&self) -> Option<u32> { None }
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(
-        &mut self,
-        range: Range<u32>,
-        recycler: &mut Recycler<Stack>,
-        mut f: F,
-    ) -> Result<(), E> {
+    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, mut f: F) -> Result<(), E> {
         for i in range {
-            match self.entry(i) {
+            match self.inner.entry(i) {
                 BEntry::Vacant(vacant) => {
-                    let mut vec = recycler.lease();
+                    let mut vec = self.recycler.lease();
                     let should_remove = f(&mut *vec)?;
                     if !should_remove {
                         vacant.insert(vec.take());
@@ -145,7 +144,7 @@ impl PointerMap for BTreeMap<u32, Stack> {
                 BEntry::Occupied(mut entry) => {
                     let should_remove = f(entry.get_mut())?;
                     if should_remove {
-                        recycler.put(entry.remove());
+                        self.recycler.put(entry.remove());
                     }
                 }
             }
@@ -169,11 +168,10 @@ impl Recycle for Stack {
 }
 
 #[derive(Debug)]
-pub struct MemoryBlock<D, M = BTreeMap<u32, Stack>> {
+pub struct MemoryBlock<D, M = BTreePointerMap> {
     memory: M,
     deallocated: FxHashSet<Pointer>,
     allocations: Slab<Vec<Pointer>>,
-    stack_recycler: Recycler<Stack>,
     store: PointerStore<D>,
 }
 
@@ -293,7 +291,6 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             store: PointerStore::new(),
             allocations: Slab::new(),
             deallocated: FxHashSet::default(),
-            stack_recycler: Recycler::new(),
         }
     }
 
@@ -303,8 +300,6 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
     pub fn is_deallocated(&self, ptr: Pointer) -> bool { self.deallocated.contains(&ptr) }
 
-    pub fn recylcer(&mut self) -> &mut Recycler<Stack> { &mut self.stack_recycler }
-
     pub fn allocate(&mut self, ptr: Pointer, range: Range<u32>) -> Result {
         check_dealloc!(self, ptr);
 
@@ -312,17 +307,16 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             panic!("Could not allocate already tracked pointer")
         }
 
-        self.memory
-            .for_each(range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                if byte.is_empty() {
-                    Ok(false)
-                } else {
-                    Err(Error::AllocateRangeOccupied {
-                        ptr,
-                        range: range.clone(),
-                    })
-                }
-            })?;
+        self.memory.for_each(range.clone(), |Stack(byte)| {
+            if byte.is_empty() {
+                Ok(false)
+            } else {
+                Err(Error::AllocateRangeOccupied {
+                    ptr,
+                    range: range.clone(),
+                })
+            }
+        })?;
 
         let alloc_id =
             u32::try_from(self.allocations.insert(Vec::new())).expect("Tried to create too many allocations");
@@ -336,7 +330,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             range: range.clone(),
         });
 
-        self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
+        self.memory.for_each(range, |Stack(byte)| {
             byte.push(id);
             Ok(false)
         })
@@ -393,7 +387,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let (id, source_id, source_range) =
             self.reborrow_common(ptr, source, PtrType::Exclusive, range.clone(), meta)?;
 
-        self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
+        self.memory.for_each(range, |Stack(byte)| {
             let pos = 1 + search(source, source_id, byte, &source_range)?;
             byte.truncate(pos);
             byte.push(id);
@@ -406,7 +400,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let ptr_info = &self.store.ptr_info;
         let mut filter = D::filter_all();
 
-        self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
+        self.memory.for_each(range, |Stack(byte)| {
             let pos = 1 + search(source, source_id, byte, &source_range).unwrap();
 
             let offset = byte[pos..].iter().position(|&id| {
@@ -440,12 +434,11 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             let (old_id, id, info) = self.store.make_exclusive(ptr).unwrap();
             let range = info.range.clone();
 
-            self.memory
-                .for_each(range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                    let pos = search(ptr, old_id, byte, &range).unwrap();
-                    byte.insert(pos + 1, id);
-                    Ok(false)
-                })?
+            self.memory.for_each(range.clone(), |Stack(byte)| {
+                let pos = search(ptr, old_id, byte, &range).unwrap();
+                byte.insert(pos + 1, id);
+                Ok(false)
+            })?
         }
 
         let info = &mut self.store.ptr_info[id as usize];
@@ -500,13 +493,12 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         info.ptr_ty = PtrType::Exclusive;
         let info = &self.store.ptr_info[id as usize];
 
-        self.memory
-            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                let pos = search(ptr, old_id, byte, &info.range).unwrap();
-                byte.truncate(pos);
-                byte.push(id);
-                Ok(false)
-            })
+        self.memory.for_each(info.range.clone(), |Stack(byte)| {
+            let pos = search(ptr, old_id, byte, &info.range).unwrap();
+            byte.truncate(pos);
+            byte.push(id);
+            Ok(false)
+        })
     }
 
     pub fn mark_shared(&mut self, ptr: Pointer) -> Result {
@@ -515,11 +507,10 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
         let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
 
-        self.memory
-            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                search(ptr, id, byte, &info.range).unwrap();
-                Ok(false)
-            })?;
+        self.memory.for_each(info.range.clone(), |Stack(byte)| {
+            search(ptr, id, byte, &info.range).unwrap();
+            Ok(false)
+        })?;
 
         let (_, info) = self.store.get_mut(ptr).unwrap();
         info.ptr_ty = PtrType::Shared;
@@ -538,21 +529,20 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let ptr_info = &self.store.ptr_info;
         let meta = info.meta;
 
-        self.memory
-            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
+        self.memory.for_each(info.range.clone(), |Stack(byte)| {
+            let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
 
-                let offset = byte[pos..].iter().position(|&id| {
-                    let info = &ptr_info[id as usize];
-                    info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
-                });
+            let offset = byte[pos..].iter().position(|&id| {
+                let info = &ptr_info[id as usize];
+                info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
+            });
 
-                if let Some(offset) = offset {
-                    byte.truncate(pos + offset);
-                }
+            if let Some(offset) = offset {
+                byte.truncate(pos + offset);
+            }
 
-                Ok(false)
-            })
+            Ok(false)
+        })
     }
 
     fn assert_exclusive_inner(&mut self, ptr: Pointer, keep: bool) -> Result {
@@ -565,12 +555,11 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             return Err(Error::NotExclusive(ptr))
         }
 
-        self.memory
-            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                let pos = search(ptr, id, byte, &info.range).unwrap();
-                byte.truncate(pos + usize::from(keep));
-                Ok(!keep && byte.is_empty())
-            })
+        self.memory.for_each(info.range.clone(), |Stack(byte)| {
+            let pos = search(ptr, id, byte, &info.range).unwrap();
+            byte.truncate(pos + usize::from(keep));
+            Ok(!keep && byte.is_empty())
+        })
     }
 }
 
