@@ -64,8 +64,6 @@ impl<T: Recycle> Recycler<T> {
         }
     }
 
-    pub fn clear(&mut self) { self.heap.get_mut().clear() }
-
     pub fn put(&mut self, item: T) { self.heap.get_mut().push(Empty(item.empty())); }
 
     pub fn take(&mut self) -> T {

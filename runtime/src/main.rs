@@ -103,34 +103,24 @@ impl<'a> Allocator<'a> {
 
 fn span_to_string(span: &Range<usize>, line_offsets: &[usize]) -> String {
     let line_start = match line_offsets.binary_search(&span.start) {
-        Ok(x) | Err(x) => x,
+        Ok(x) => x,
+        Err(x) => x - 1,
     };
     let line_end = match line_offsets.binary_search(&span.end) {
-        Ok(x) | Err(x) => x,
+        Ok(x) => x,
+        Err(x) => x - 1,
     };
 
     let col_start = span.start - line_offsets[line_start];
     let col_end = span.end - line_offsets[line_end];
 
-    let mut line_end = if line_start + 1 == line_end && col_end == 0 {
-        1 + line_start
-    } else {
-        line_end
-    };
-
-    let col_end = if col_end == 0 {
-        let col_end = line_offsets[line_end] - line_offsets[line_end - 1] - 1;
-        if col_end == 0 {
-            line_end -= 1;
-            line_offsets[line_end] - line_offsets[line_end - 1]
-        } else {
-            col_end
-        }
-    } else {
-        col_end
-    };
-
-    format!("span({}:{}..{}:{})", 1 + line_start, 1 + col_start, line_end, col_end)
+    format!(
+        "span({}:{}..{}:{})",
+        1 + line_start,
+        1 + col_start,
+        1 + line_end,
+        1 + col_end
+    )
 }
 
 #[cold]
@@ -249,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chain(file.split('\n').map(|input| {
             let len = input.len() + 1;
             sum += len;
-            sum - 2
+            sum
         }))
         .chain(std::iter::once(file.len()))
         .collect::<Vec<_>>();

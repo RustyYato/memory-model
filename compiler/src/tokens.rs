@@ -69,9 +69,9 @@ impl SplitOnce for &str {
 
 pub fn parse_token<'a, E: ParseError<Input<'a>>>(input: Input<'a>) -> PResult<Input<'a>, Token<'_>, E> {
     match parse_token_type(input.inner()) {
-        Ok((new_input, kind)) => {
+        Ok((new_input, (ws_offset, kind))) => {
             let offset = input.len() - new_input.len();
-            let start = input.pos();
+            let start = input.pos() + ws_offset;
             let input = input.advance(offset).ok().unwrap();
             let end = input.pos();
             Ok((input, Token { span: start..end, kind }))
@@ -86,7 +86,8 @@ pub fn parse_token<'a, E: ParseError<Input<'a>>>(input: Input<'a>) -> PResult<In
 }
 
 #[allow(clippy::or_fun_call)]
-fn parse_token_type(mut input: &str) -> PResult<&str, TokenKind<'_>> {
+fn parse_token_type(mut input: &str) -> PResult<&str, (usize, TokenKind<'_>)> {
+    let offset = input.len();
     loop {
         input = input.trim_start();
 
@@ -97,10 +98,11 @@ fn parse_token_type(mut input: &str) -> PResult<&str, TokenKind<'_>> {
             break
         }
     }
+    let offset = offset - input.len();
 
     match input.split_with(|c: char| !c.is_ascii_digit()) {
         ("", _) => (),
-        (number, input) => return Ok((input, TokenKind::Number(number.parse().unwrap()))),
+        (number, input) => return Ok((input, (offset, TokenKind::Number(number.parse().unwrap())))),
     }
 
     match input.split_with(|c: char| !c.is_alphanumeric() && c != '_') {
@@ -116,24 +118,26 @@ fn parse_token_type(mut input: &str) -> PResult<&str, TokenKind<'_>> {
                 _ => TokenKind::Ident(ident),
             };
 
-            return Ok((input, tok))
+            return Ok((input, (offset, tok)))
         }
     }
 
     if let Some(input) = input.strip_prefix("..") {
-        return Ok((input, TokenKind::Symbol(Symbol::Dot2)))
+        return Ok((input, (offset, TokenKind::Symbol(Symbol::Dot2))))
     }
 
     if let Some(input) = input.strip_prefix("->") {
-        return Ok((input, TokenKind::Symbol(Symbol::Arrow)))
+        return Ok((input, (offset, TokenKind::Symbol(Symbol::Arrow))))
     }
 
-    match input.get(0..1) {
-        Some("(") => Ok((&input[1..], TokenKind::Symbol(Symbol::OpenParen))),
-        Some(")") => Ok((&input[1..], TokenKind::Symbol(Symbol::CloseParen))),
-        Some(";") => Ok((&input[1..], TokenKind::Symbol(Symbol::SemiColon))),
-        Some("=") => Ok((&input[1..], TokenKind::Symbol(Symbol::Equal))),
-        Some("@") => Ok((&input[1..], TokenKind::Symbol(Symbol::Borrow))),
-        _ => Err(Error::Error((input, ErrorKind::Custom("no token found")))),
-    }
+    let kind = match input.get(0..1) {
+        Some("(") => TokenKind::Symbol(Symbol::OpenParen),
+        Some(")") => TokenKind::Symbol(Symbol::CloseParen),
+        Some(";") => TokenKind::Symbol(Symbol::SemiColon),
+        Some("=") => TokenKind::Symbol(Symbol::Equal),
+        Some("@") => TokenKind::Symbol(Symbol::Borrow),
+        _ => return Err(Error::Error((input, ErrorKind::Custom("no token found")))),
+    };
+
+    Ok((&input[1..], (offset, kind)))
 }
