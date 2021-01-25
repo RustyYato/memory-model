@@ -22,6 +22,22 @@ macro_rules! check_dealloc {
     };
 }
 
+macro_rules! check_range {
+    ($self:expr, $ptr:expr, $range:expr) => {{
+        let ptr = $ptr;
+        let (id, info) = $self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let range = $range.unwrap_or_else(|| info.range.clone());
+        $self
+            .memory
+            .for_each(range.clone(), &mut $self.stack_recycler, |Stack(byte)| {
+                search(ptr, id, byte, &range).map(|_| false)
+            })?
+    }};
+    ($self:expr, $ptr:expr) => {
+        check_range!($self, $ptr, None)
+    };
+}
+
 pub trait PointerMap {
     fn with_size(size: u32) -> Self;
 
@@ -277,6 +293,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
     pub fn allocate(&mut self, ptr: Pointer, range: Range<u32>) -> Result {
         check_dealloc!(self, ptr);
+
         if self.store.counters.contains_key(&ptr) {
             panic!("Could not allocate already tracked pointer")
         }
@@ -323,8 +340,10 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         check_dealloc!(self, ptr);
 
         if self.store.counters.contains_key(&ptr) {
-            panic!("Could not allocate already tracked pointer")
+            panic!("Could not borrow already tracked pointer")
         }
+
+        check_range!(self, source, Some(range.clone()));
 
         let (source_id, source_info) = self.store.get(source).ok_or(Error::InvalidPtr(source))?;
 
@@ -361,7 +380,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             self.reborrow_common(ptr, source, PtrType::Exclusive, range.clone(), meta)?;
 
         self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
-            let pos = 1 + search(source, id, byte, &source_range)?;
+            let pos = 1 + search(source, id, byte, &source_range).unwrap();
             byte.truncate(pos);
             byte.push(id);
             Ok(false)
@@ -374,7 +393,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let mut filter = D::filter_all();
 
         self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
-            let pos = 1 + search(source, source_id, byte, &source_range)?;
+            let pos = 1 + search(source, source_id, byte, &source_range).unwrap();
 
             let offset = byte[pos..].iter().position(|&id| {
                 let info = &ptr_info[id as usize];
@@ -401,9 +420,10 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             return Err(Error::InvalidatesOldMeta(ptr))
         }
 
-        info.meta = meta;
-
         if info.copies != 1 && old_meta.does_invalidate(meta, &mut D::filter_all()) {
+            check_range!(self, ptr);
+
+            let info = &mut self.store.ptr_info[id as usize];
             info.copies -= 1;
             let mut info = info.clone();
             info.copies = 1;
@@ -417,6 +437,9 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
                     Ok(false)
                 })?
         }
+
+        let info = &mut self.store.ptr_info[id as usize];
+        info.meta = meta;
 
         OK
     }
@@ -439,8 +462,6 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
     }
 
     pub fn deallocate(&mut self, ptr: Pointer) -> Result {
-        check_dealloc!(self, ptr);
-
         if !self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?.1.owns_allocation {
             return Err(Error::DeallocateNonOwning(ptr))
         }
@@ -463,12 +484,14 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
     pub fn mark_exclusive(&mut self, ptr: Pointer) -> Result {
         check_dealloc!(self, ptr);
+        check_range!(self, ptr);
+
         let (old_id, id, info) = self.store.make_exclusive(ptr)?;
         info.ptr_ty = PtrType::Exclusive;
         let info = &self.store.ptr_info[id as usize];
         self.memory
             .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                let pos = search(ptr, old_id, byte, &info.range)?;
+                let pos = search(ptr, old_id, byte, &info.range).unwrap();
                 byte.truncate(pos);
                 byte.push(id);
                 Ok(false)
@@ -477,6 +500,14 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
     pub fn mark_shared(&mut self, ptr: Pointer) -> Result {
         check_dealloc!(self, ptr);
+        check_range!(self, ptr);
+
+        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        self.memory
+            .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
+                search(ptr, id, byte, &info.range).unwrap();
+                Ok(false)
+            })?;
         let (_, info) = self.store.get_mut(ptr).unwrap();
         info.ptr_ty = PtrType::Shared;
         self.assert_shared(ptr, D::filter_all())?;
@@ -487,6 +518,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
     pub fn assert_shared(&mut self, ptr: Pointer, mut filter: D::Filter) -> Result {
         check_dealloc!(self, ptr);
+        check_range!(self, ptr);
 
         let filter = &mut filter;
         let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
@@ -495,7 +527,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
         self.memory
             .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                let pos = 1 + search(ptr, id, byte, &info.range)?;
+                let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
                 let offset = byte[pos..].iter().position(|&id| {
                     let info = &ptr_info[id as usize];
                     info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
@@ -511,6 +543,8 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
     fn assert_exclusive_inner(&mut self, ptr: Pointer, keep: bool) -> Result {
         check_dealloc!(self, ptr);
+        check_range!(self, ptr);
+
         let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
 
         if info.ptr_ty != PtrType::Exclusive {
@@ -519,7 +553,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
         self.memory
             .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                let pos = search(ptr, id, byte, &info.range)?;
+                let pos = search(ptr, id, byte, &info.range).unwrap();
                 byte.truncate(pos + usize::from(keep));
                 Ok(!keep && byte.is_empty())
             })
