@@ -6,7 +6,7 @@ mod recycle;
 
 use std::fmt;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pointer(std::num::NonZeroU32);
 
 impl Pointer {

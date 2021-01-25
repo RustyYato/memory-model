@@ -174,7 +174,6 @@ pub struct MemoryBlock<D, M = BTreeMap<u32, Stack>> {
     deallocated: FxHashSet<Pointer>,
     allocations: Slab<Vec<Pointer>>,
     stack_recycler: Recycler<Stack>,
-    vec_recycler: Recycler<Vec<Pointer>>,
     store: PointerStore<D>,
 }
 
@@ -187,10 +186,10 @@ struct PointerStore<D> {
 #[derive(Debug, Clone)]
 pub struct PointerInfo<D> {
     copies: u32,
+    pub alloc_id: u32,
     pub range: Range<u32>,
     pub ptr_ty: PtrType,
     pub owns_allocation: bool,
-    pub alloc_id: u32,
     pub meta: D,
 }
 
@@ -295,7 +294,6 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             allocations: Slab::new(),
             deallocated: FxHashSet::default(),
             stack_recycler: Recycler::new(),
-            vec_recycler: Recycler::new(),
         }
     }
 
@@ -326,8 +324,8 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
                 }
             })?;
 
-        let alloc_id = u32::try_from(self.allocations.insert(self.vec_recycler.take()))
-            .expect("Tried to create too many allocations");
+        let alloc_id =
+            u32::try_from(self.allocations.insert(Vec::new())).expect("Tried to create too many allocations");
 
         let id = self.store.alloc(ptr, PointerInfo {
             alloc_id,
@@ -392,11 +390,11 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
     }
 
     pub fn reborrow_exclusive(&mut self, ptr: Pointer, source: Pointer, range: Range<u32>, meta: D) -> Result {
-        let (id, _source_id, source_range) =
+        let (id, source_id, source_range) =
             self.reborrow_common(ptr, source, PtrType::Exclusive, range.clone(), meta)?;
 
         self.memory.for_each(range, &mut self.stack_recycler, |Stack(byte)| {
-            let pos = 1 + search(source, id, byte, &source_range).unwrap();
+            let pos = 1 + search(source, source_id, byte, &source_range)?;
             byte.truncate(pos);
             byte.push(id);
             Ok(false)
@@ -473,7 +471,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         OK
     }
 
-    pub fn deallocate(&mut self, ptr: Pointer) -> Result {
+    pub fn deallocate(&mut self, ptr: Pointer) -> Result<Vec<Pointer>> {
         if !self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?.1.owns_allocation {
             return Err(Error::DeallocateNonOwning(ptr))
         }
@@ -484,14 +482,14 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         self.deallocated.insert(ptr);
         let mut allocation = self.allocations.remove(info.alloc_id as usize);
 
-        for ptr in allocation.drain(..) {
+        for &ptr in allocation.iter() {
             let _ = self.store.drop(ptr);
             self.deallocated.insert(ptr);
         }
 
-        self.vec_recycler.put(allocation);
+        allocation.push(ptr);
 
-        OK
+        Ok(allocation)
     }
 
     pub fn mark_exclusive(&mut self, ptr: Pointer) -> Result {
@@ -590,13 +588,13 @@ impl<D: fmt::Debug> fmt::Debug for PointerStore<D> {
         let mut f = f.debug_map();
 
         #[derive(Debug)]
-        struct Struct<A, B> {
+        struct PointerData<A, B> {
             copy_id: A,
             info: B,
         }
 
         for (ptr, &id) in &self.counters {
-            f.entry(&ptr, &Struct {
+            f.entry(&ptr, &PointerData {
                 copy_id: id,
                 info: &self.ptr_info[id as usize],
             });

@@ -54,11 +54,24 @@ impl Metadata for Permissions {
 struct Allocator<'a> {
     name_to_ptr: HashMap<&'a str, Pointer>,
     ptr_to_name: FxHashMap<Pointer, &'a str>,
+    invalidated: HashMap<&'a str, Invalidated>,
+}
+
+struct Invalidated {
+    span: Range<usize>,
+    kind: InvalidKind,
+}
+
+enum InvalidKind {
+    Freed,
+    Moved,
 }
 
 impl<'a> Allocator<'a> {
     fn alloc(&mut self, name: &'a str) -> Pointer {
         let ptr = Pointer::create();
+
+        self.invalidated.remove(name);
 
         self.name_to_ptr.insert(name, ptr);
         self.ptr_to_name.insert(ptr, name);
@@ -66,8 +79,12 @@ impl<'a> Allocator<'a> {
         ptr
     }
 
-    fn dealloc(&mut self, ptr: Pointer) {
+    fn dealloc(&mut self, ptr: Pointer, span: Range<usize>) {
         let name = self.ptr_to_name.remove(&ptr).unwrap();
+        self.invalidated.insert(name, Invalidated {
+            span,
+            kind: InvalidKind::Freed,
+        });
         self.name_to_ptr.remove(name);
     }
 
@@ -84,16 +101,7 @@ impl<'a> Allocator<'a> {
     }
 }
 
-#[cold]
-#[inline(never)]
-fn handle_error(
-    err: Error,
-    span: std::ops::Range<usize>,
-    allocator: &Allocator,
-    line_offsets: &[usize],
-) -> Box<dyn std::error::Error> {
-    use memory_model::alias::Error::*;
-
+fn span_to_string(span: &Range<usize>, line_offsets: &[usize]) -> String {
     let line_start = match line_offsets.binary_search(&span.start) {
         Ok(x) | Err(x) => x,
     };
@@ -122,64 +130,96 @@ fn handle_error(
         col_end
     };
 
-    let span = format!("{}:{}..{}:{}", 1 + line_start, 1 + col_start, line_end, col_end);
+    format!("span({}:{}..{}:{})", 1 + line_start, 1 + col_start, line_end, col_end)
+}
+
+#[cold]
+#[inline(never)]
+fn handle_error(
+    err: Error,
+    span: std::ops::Range<usize>,
+    allocator: &Allocator,
+    line_offsets: &[usize],
+) -> Box<dyn std::error::Error> {
+    use memory_model::alias::Error::*;
+
+    let span = span_to_string(&span, line_offsets);
 
     let err = match err {
         Error::Alias(err) => err,
-        Error::InvalidPtr(ptr) => return format!("span({}): Unknown pointer `{}`", span, ptr,).into(),
+        Error::InvalidPtr(ptr) => {
+            return match allocator.invalidated.get(ptr) {
+                Some(Invalidated {
+                    kind: InvalidKind::Freed,
+                    span: freed_span,
+                }) => format!(
+                    "{}: Use of freed pointer `{ptr}`. Note: freed `{ptr}` at {freed_span}",
+                    span,
+                    ptr = ptr,
+                    freed_span = span_to_string(&freed_span, line_offsets)
+                )
+                .into(),
+                Some(Invalidated {
+                    kind: InvalidKind::Moved,
+                    span: moved_span,
+                }) => format!(
+                    "{}: Use of moved pointer `{ptr}`. Note: moved `{ptr}` at {moved_span}",
+                    span,
+                    ptr = ptr,
+                    moved_span = span_to_string(&moved_span, line_offsets)
+                )
+                .into(),
+                None => format!("{}: Unknown pointer `{}`", span, ptr).into(),
+            }
+        }
     };
 
     match err {
         ReborrowInvalidatesSource { ptr, source } => format!(
-            "span({}): Could not borrow `{}`, because it invalidated it's source `{}`",
+            "{}: Could not borrow `{}`, because it invalidated it's source `{}`",
             span,
             allocator.name(ptr),
             allocator.name(source)
         )
         .into(),
-        UseAfterFree(ptr) => format!(
-            "span({}): Tried to use `{}` after it was freed",
-            span,
-            allocator.name(ptr)
-        )
-        .into(),
+        UseAfterFree(ptr) => format!("{}: Tried to use `{}` after it was freed", span, allocator.name(ptr)).into(),
         InvalidPtr(ptr) => format!(
-            "span({}): Tried to use `{}`, which was never registered",
+            "{}: Tried to use `{}`, which was never registered",
             span,
             allocator.name(ptr)
         )
         .into(),
         NotExclusive(ptr) => format!(
-            "span({}): Tried to use `{}` exclusively, but it is shared",
+            "{}: Tried to use `{}` exclusively, but it is shared",
             span,
             allocator.name(ptr)
         )
         .into(),
         NotShared(ptr) => format!(
-            "span({}): Tried to use `{}` as shared, but it is exclusive",
+            "{}: Tried to use `{}` as shared, but it is exclusive",
             span,
             allocator.name(ptr)
         )
         .into(),
         DeallocateNonOwning(ptr) => format!(
-            "span({}): Tried to deallocate `{}`, but it doesn't own an allocation",
+            "{}: Tried to deallocate `{}`, but it doesn't own an allocation",
             span,
             allocator.name(ptr)
         )
         .into(),
         InvalidatesOldMeta(ptr) => format!(
-            "span({}): Tried to update the meta data of `{}`, but it would invalidate itself",
+            "{}: Tried to update the meta data of `{}`, but it would invalidate itself",
             span,
             allocator.name(ptr)
         )
         .into(),
         AllocateRangeOccupied { ptr: _, range } => format!(
-            "span({}): Tried to allocate in range {:?}, but that range is already occupied",
+            "{}: Tried to allocate in range {:?}, but that range is already occupied",
             span, range
         )
         .into(),
         InvalidForRange { ptr, range } => format!(
-            "span({}): Tried to use `{}` for the range {:?}, but it is not valid for that range",
+            "{}: Tried to use `{}` for the range {:?}, but it is not valid for that range",
             span,
             allocator.name(ptr),
             range
@@ -190,7 +230,7 @@ fn handle_error(
             source,
             source_range,
         } => format!(
-            "span({}): Tried to reborrow `{}` from `{2}` for the range {3:?}, but `{2}` is not valid for that range",
+            "{}: Tried to reborrow `{}` from `{2}` for the range {3:?}, but `{2}` is not valid for that range",
             span,
             allocator.name(ptr),
             allocator.name(source),
@@ -253,8 +293,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             AstKind::Drop { name } => {
                 let ptr = try_or_throw!(allocator.ptr(name));
-                try_or_throw!(model.deallocate(ptr));
-                allocator.dealloc(ptr);
+                let mut deallocated = try_or_throw!(model.deallocate(ptr));
+                deallocated.sort_unstable();
+                deallocated.dedup();
+                for ptr in deallocated {
+                    allocator.dealloc(ptr, ast.span.clone());
+                }
             }
             AstKind::Borrow {
                 name,
@@ -321,6 +365,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             AstKind::Move { name, source } => {
                 let source_ptr = try_or_throw!(allocator.ptr(source));
+                allocator.invalidated.insert(source, Invalidated {
+                    span: ast.span.clone(),
+                    kind: InvalidKind::Moved,
+                });
 
                 let info = try_or_throw!(model.info(source_ptr));
                 match info.ptr_ty {
