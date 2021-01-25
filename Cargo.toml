@@ -1,5 +1,7 @@
 [workspace]
 
 members = [
-    'memory-model'
+    'memory-model',
+    'compiler',
+    'runtime',
 ]

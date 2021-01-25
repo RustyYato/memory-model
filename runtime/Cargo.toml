@@ -1,0 +1,14 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+authors = ["RustyYato <krishna.sd.2012@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+compiler = { path = '../compiler' }
+memory-model = { path = '../memory-model' }
+dec = { path = '../../parser/dec' }
+fxhash = '0.2'
+hashbrown = '0.9'

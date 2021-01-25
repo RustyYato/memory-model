@@ -133,8 +133,8 @@ pub struct PointerInfo<D> {
     pub ptr_ty: PtrType,
     pub owns_allocation: bool,
     pub alloc_id: u32,
-    pub meta: D,
     pub copy_id: u32,
+    pub meta: D,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
