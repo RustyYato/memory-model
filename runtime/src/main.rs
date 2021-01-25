@@ -1,14 +1,23 @@
 use core::panic;
 use std::ops::Range;
 
-use compiler::ast::Ast;
+use compiler::ast::AstKind;
 use fxhash::FxHashMap;
 use memory_model::{
-    alias::{Error, MemoryBlock, Metadata, PtrType},
+    alias::{MemoryBlock, Metadata, PtrType},
     Pointer,
 };
 
 use hashbrown::HashMap;
+
+enum Error<'a> {
+    Alias(memory_model::alias::Error),
+    InvalidPtr(&'a str),
+}
+
+impl From<memory_model::alias::Error> for Error<'_> {
+    fn from(err: memory_model::alias::Error) -> Self { Self::Alias(err) }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Permissions {
@@ -64,7 +73,9 @@ impl<'a> Allocator<'a> {
 
     fn name(&self, ptr: Pointer) -> &'a str { self.ptr_to_name[&ptr] }
 
-    fn ptr(&self, name: &str) -> Pointer { self.name_to_ptr[name] }
+    fn ptr<'n>(&self, name: &'n str) -> Result<Pointer, Error<'n>> {
+        self.name_to_ptr.get(name).copied().ok_or(Error::InvalidPtr(name))
+    }
 
     fn rename(&mut self, source: &str, name: &'a str) {
         let ptr = self.name_to_ptr.remove(source).unwrap();
@@ -75,41 +86,101 @@ impl<'a> Allocator<'a> {
 
 #[cold]
 #[inline(never)]
-fn handle_error<M: memory_model::alias::PointerMap>(
+fn handle_error(
     err: Error,
-    ast: Ast<'_>,
+    span: std::ops::Range<usize>,
     allocator: &Allocator,
-    model: &MemoryBlock<Permissions, M>,
+    line_offsets: &[usize],
 ) -> Box<dyn std::error::Error> {
-    use Error::*;
+    use memory_model::alias::Error::*;
+
+    let line_start = match line_offsets.binary_search(&span.start) {
+        Ok(x) | Err(x) => x,
+    };
+    let line_end = match line_offsets.binary_search(&span.end) {
+        Ok(x) | Err(x) => x,
+    };
+
+    let col_start = span.start - line_offsets[line_start];
+    let col_end = span.end - line_offsets[line_end];
+
+    let mut line_end = if line_start + 1 == line_end && col_end == 0 {
+        1 + line_start
+    } else {
+        line_end
+    };
+
+    let col_end = if col_end == 0 {
+        let col_end = line_offsets[line_end] - line_offsets[line_end - 1] - 1;
+        if col_end == 0 {
+            line_end -= 1;
+            line_offsets[line_end] - line_offsets[line_end - 1]
+        } else {
+            col_end
+        }
+    } else {
+        col_end
+    };
+
+    let span = format!("{}:{}..{}:{}", 1 + line_start, 1 + col_start, line_end, col_end);
+
+    let err = match err {
+        Error::Alias(err) => err,
+        Error::InvalidPtr(ptr) => return format!("span({}): Unknown pointer `{}`", span, ptr,).into(),
+    };
+
     match err {
         ReborrowInvalidatesSource { ptr, source } => format!(
-            "Could not borrow `{}`, because it invalidated it's source `{}`",
+            "span({}): Could not borrow `{}`, because it invalidated it's source `{}`",
+            span,
             allocator.name(ptr),
             allocator.name(source)
         )
         .into(),
-        UseAfterFree(ptr) => format!("Tried to use `{}` after it was freed", allocator.name(ptr)).into(),
-        InvalidPtr(ptr) => format!("Tried to use `{}`, which was never registered", allocator.name(ptr)).into(),
-        NotExclusive(ptr) => format!("Tried to use `{}` exclusively, but it is shared", allocator.name(ptr)).into(),
-        NotShared(ptr) => format!("Tried to use `{}` as shared, but it is exclusive", allocator.name(ptr)).into(),
+        UseAfterFree(ptr) => format!(
+            "span({}): Tried to use `{}` after it was freed",
+            span,
+            allocator.name(ptr)
+        )
+        .into(),
+        InvalidPtr(ptr) => format!(
+            "span({}): Tried to use `{}`, which was never registered",
+            span,
+            allocator.name(ptr)
+        )
+        .into(),
+        NotExclusive(ptr) => format!(
+            "span({}): Tried to use `{}` exclusively, but it is shared",
+            span,
+            allocator.name(ptr)
+        )
+        .into(),
+        NotShared(ptr) => format!(
+            "span({}): Tried to use `{}` as shared, but it is exclusive",
+            span,
+            allocator.name(ptr)
+        )
+        .into(),
         DeallocateNonOwning(ptr) => format!(
-            "Tried to deallocate `{}`, but it doesn't own an allocation",
+            "span({}): Tried to deallocate `{}`, but it doesn't own an allocation",
+            span,
             allocator.name(ptr)
         )
         .into(),
         InvalidatesOldMeta(ptr) => format!(
-            "Tried to update the meta data of `{}`, but it would invalidate itself",
+            "span({}): Tried to update the meta data of `{}`, but it would invalidate itself",
+            span,
             allocator.name(ptr)
         )
         .into(),
         AllocateRangeOccupied { ptr: _, range } => format!(
-            "Tried to allocate in range {:?}, but that range is already occupied",
-            range
+            "span({}): Tried to allocate in range {:?}, but that range is already occupied",
+            span, range
         )
         .into(),
         InvalidForRange { ptr, range } => format!(
-            "Tried to use `{}` for the range {:?}, but it is not valid for that range",
+            "span({}): Tried to use `{}` for the range {:?}, but it is not valid for that range",
+            span,
             allocator.name(ptr),
             range
         )
@@ -119,7 +190,8 @@ fn handle_error<M: memory_model::alias::PointerMap>(
             source,
             source_range,
         } => format!(
-            "Tried to reborrow `{}` from `{1}` for the range {2:?}, but `{1}` is not valid for that range",
+            "span({}): Tried to reborrow `{}` from `{2}` for the range {3:?}, but `{2}` is not valid for that range",
+            span,
             allocator.name(ptr),
             allocator.name(source),
             source_range
@@ -131,9 +203,21 @@ fn handle_error<M: memory_model::alias::PointerMap>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = std::env::args().nth(1).unwrap();
     let file = std::fs::read_to_string(file).unwrap();
-    let (input, tokens) = compiler::tokens::parse::<dec::base::error::DefaultError<_>>(&file).unwrap();
+
+    let mut sum = 0;
+    let line_offsets = std::iter::once(0)
+        .chain(file.split('\n').map(|input| {
+            let len = input.len() + 1;
+            sum += len;
+            sum - 2
+        }))
+        .chain(std::iter::once(file.len()))
+        .collect::<Vec<_>>();
+
+    let input = dec::base::indexed::Indexed::new(file.as_str());
+    let (input, tokens) = compiler::tokens::parse::<dec::base::error::DefaultError<_>>(input).unwrap();
     if !input.is_empty() {
-        println!("{}", input);
+        println!("{}", input.inner());
         return Err("Could not parse tokens".into())
     }
     let (input, ast) = compiler::ast::parse::<dec::base::error::DefaultError<_>>(&tokens).unwrap();
@@ -151,13 +235,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ($result:expr) => {
                 match $result {
                     Ok(x) => x,
-                    Err(e) => return Err(handle_error(e, ast, &allocator, &model)),
+                    Err(e) => return Err(handle_error(Error::from(e), ast.span, &allocator, &line_offsets)),
                 }
             };
         }
 
-        match ast.clone() {
-            Ast::Allocate { name, range } => match range {
+        match ast.kind {
+            AstKind::Allocate { name, range } => match range {
                 Range {
                     start: Some(start),
                     end: Some(end),
@@ -167,12 +251,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => panic!("range bounds not specified"),
             },
-            Ast::Drop { name } => {
-                let ptr = allocator.ptr(name);
+            AstKind::Drop { name } => {
+                let ptr = try_or_throw!(allocator.ptr(name));
                 try_or_throw!(model.deallocate(ptr));
                 allocator.dealloc(ptr);
             }
-            Ast::Borrow {
+            AstKind::Borrow {
                 name,
                 source,
                 is_exclusive,
@@ -181,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 write,
             } => {
                 let ptr = allocator.alloc(name);
-                let source = allocator.ptr(source);
+                let source = try_or_throw!(allocator.ptr(source));
 
                 let info = try_or_throw!(model.info(source));
                 let source_range = &info.range;
@@ -199,13 +283,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 try_or_throw!(res);
             }
-            Ast::Update {
+            AstKind::Update {
                 name,
                 is_exclusive,
                 read,
                 write,
             } => {
-                let ptr = allocator.ptr(name);
+                let ptr = try_or_throw!(allocator.ptr(name));
                 let res = if is_exclusive {
                     model.mark_exclusive(ptr)
                 } else {
@@ -215,8 +299,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let res = model.update_meta(ptr, |_| Permissions { read, write });
                 try_or_throw!(res);
             }
-            Ast::Write { name, is_exclusive } => {
-                let ptr = allocator.ptr(name);
+            AstKind::Write { name, is_exclusive } => {
+                let ptr = try_or_throw!(allocator.ptr(name));
                 assert!(try_or_throw!(model.info(ptr)).meta.write);
                 let res = if is_exclusive {
                     model.assert_exclusive(ptr)
@@ -225,8 +309,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 try_or_throw!(res);
             }
-            Ast::Read { name, is_exclusive } => {
-                let ptr = allocator.ptr(name);
+            AstKind::Read { name, is_exclusive } => {
+                let ptr = try_or_throw!(allocator.ptr(name));
                 assert!(try_or_throw!(model.info(ptr)).meta.read);
                 let res = if is_exclusive {
                     model.assert_exclusive(ptr)
@@ -235,8 +319,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 try_or_throw!(res);
             }
-            Ast::Move { name, source } => {
-                let source_ptr = allocator.ptr(source);
+            AstKind::Move { name, source } => {
+                let source_ptr = try_or_throw!(allocator.ptr(source));
 
                 let info = try_or_throw!(model.info(source_ptr));
                 match info.ptr_ty {

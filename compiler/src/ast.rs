@@ -1,5 +1,29 @@
+use std::ops::Range;
+
+use dec::{
+    base::{
+        error::{CaptureInput, Error, PResult, ParseError},
+        ParseOnce, Tag,
+    },
+    branch::any,
+    combinator::opt,
+    map::{map, value},
+    seq::all,
+    tag::tag,
+};
+
+use crate::tokens::{Keyword, Symbol, Token, TokenKind};
+
+type Span = Range<usize>;
+
 #[derive(Debug, Clone)]
-pub enum Ast<'i> {
+pub struct Ast<'i> {
+    pub span: Span,
+    pub kind: AstKind<'i>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AstKind<'i> {
     Allocate {
         name: &'i str,
         range: Range<Option<u32>>,
@@ -54,78 +78,82 @@ struct Perm {
     write: bool,
 }
 
-use std::ops::Range;
-
-use dec::{
-    base::{
-        error::{CaptureInput, Error, PResult, ParseError},
-        ParseOnce, Tag,
-    },
-    branch::any,
-    combinator::opt,
-    map::{map, value},
-    seq::all,
-    tag::tag,
-};
-
-use crate::tokens::{Keyword, Symbol, Token};
-
 struct TagIdent;
 const IDENT: dec::tag::Tag<TagIdent> = dec::tag::Tag(TagIdent);
 struct TagNum;
 const NUM: dec::tag::Tag<TagNum> = dec::tag::Tag(TagNum);
 
 impl<'t, 'i> Tag<&'t [Token<'i>]> for TagIdent {
-    type Output = &'i str;
+    type Output = (Span, &'i str);
 
     fn parse_tag(
         &self,
         input: &'t [Token<'i>],
     ) -> PResult<&'t [Token<'i>], Self::Output, CaptureInput<&'t [Token<'i>]>, core::convert::Infallible> {
-        match input {
-            [Token::Ident(ident), input @ ..] => Ok((input, ident)),
+        match *input {
+            [Token {
+                kind: TokenKind::Ident(ident),
+                ref span,
+            }, ref input @ ..] => Ok((input, (span.clone(), ident))),
             _ => Err(Error::Error(CaptureInput(input))),
         }
     }
 }
 
 impl<'t, 'i> Tag<&'t [Token<'i>]> for TagNum {
-    type Output = u32;
+    type Output = (Span, u32);
 
     fn parse_tag(
         &self,
         input: &'t [Token<'i>],
     ) -> PResult<&'t [Token<'i>], Self::Output, CaptureInput<&'t [Token<'i>]>, core::convert::Infallible> {
         match *input {
-            [Token::Number(num), ref input @ ..] => Ok((input, num)),
+            [Token {
+                kind: TokenKind::Number(num),
+                ref span,
+            }, ref input @ ..] => Ok((input, (span.clone(), num))),
             _ => Err(Error::Error(CaptureInput(input))),
         }
     }
 }
 
 impl<'t, 'i> Tag<&'t [Token<'i>]> for Symbol {
-    type Output = Self;
+    type Output = (Span, Self);
 
     fn parse_tag(
         &self,
         input: &'t [Token<'i>],
     ) -> PResult<&'t [Token<'i>], Self::Output, CaptureInput<&'t [Token<'i>]>, core::convert::Infallible> {
         match *input {
-            [Token::Symbol(symbol), ref input @ ..] if *self == symbol => Ok((input, symbol)),
+            [Token {
+                kind: TokenKind::Symbol(symbol),
+                ref span,
+            }, ref input @ ..]
+                if *self == symbol =>
+            {
+                Ok((input, (span.clone(), symbol)))
+            }
             _ => Err(Error::Error(CaptureInput(input))),
         }
     }
 }
 
 impl<'t, 'i> Tag<&'t [Token<'i>]> for Keyword {
-    type Output = Self;
+    type Output = (Span, Self);
 
     fn parse_tag(
         &self,
         input: &'t [Token<'i>],
     ) -> PResult<&'t [Token<'i>], Self::Output, CaptureInput<&'t [Token<'i>]>, core::convert::Infallible> {
         match *input {
-            [Token::Keyword(keyword), ref input @ ..] if *self == keyword => Ok((input, keyword)),
+            [Token {
+                kind: TokenKind::Keyword(keyword),
+                ref span,
+            }, ref input @ ..]
+                if *self == keyword =>
+            {
+                Ok((input, (span.clone(), keyword)))
+            }
             _ => Err(Error::Error(CaptureInput(input))),
         }
     }
@@ -152,47 +180,60 @@ pub fn parse_ast<'i, 't, E: ParseError<&'t [Token<'i>]>>(
 }
 
 fn parse_drop<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, (_kw_drop, name, _sym_semi)) =
+    let (input, ((start, _kw_drop), (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Drop), IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
-    Ok((input, Ast::Drop { name }))
+    Ok((input, Ast {
+        span: start.start..end.end,
+        kind: AstKind::Drop { name },
+    }))
 }
 
 fn parse_read<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, (_kw_read, is_exclusive, name, _sym_semi)) =
+    let (input, ((start, _kw_read), is_exclusive, (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Read), parse_modifier, IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
-    Ok((input, Ast::Read { name, is_exclusive }))
+    Ok((input, Ast {
+        span: start.start..end.end,
+        kind: AstKind::Read { name, is_exclusive },
+    }))
 }
 
 fn parse_write<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, (_kw_write, is_exclusive, name, _sym_semi)) =
+    let (input, ((start, _kw_write), is_exclusive, (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Write), parse_modifier, IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
-    Ok((input, Ast::Write { name, is_exclusive }))
+    Ok((input, Ast {
+        span: start.start..end.end,
+        kind: AstKind::Write { name, is_exclusive },
+    }))
 }
 
 fn parse_update<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, (name, _sym_arrow, _sym_borrow, is_exclusive, Perm { read, write }, _sym_semi)) = all((
-        IDENT,
-        tag(Symbol::Arrow),
-        tag(Symbol::Borrow),
-        parse_modifier,
-        parse_permissions,
-        tag(Symbol::SemiColon),
-    ))
-    .parse_once(input)?;
-    Ok((input, Ast::Update {
-        name,
-        is_exclusive,
-        read,
-        write,
+    let (input, ((start, name), _sym_arrow, _sym_borrow, is_exclusive, Perm { read, write }, (end, _sym_semi))) =
+        all((
+            IDENT,
+            tag(Symbol::Arrow),
+            tag(Symbol::Borrow),
+            parse_modifier,
+            parse_permissions,
+            tag(Symbol::SemiColon),
+        ))
+        .parse_once(input)?;
+    Ok((input, Ast {
+        span: start.start..end.end,
+        kind: AstKind::Update {
+            name,
+            is_exclusive,
+            read,
+            write,
+        },
     }))
 }
 
 fn parse_decl_var<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, (_kw_let, name, _sym_eq, expr, _sym_semi)) = all((
+    let (input, ((start, _kw_let), (_, name), _sym_eq, expr, (end, _sym_semi))) = all((
         tag(Keyword::Let),
         IDENT,
         tag(Symbol::Equal),
@@ -200,16 +241,16 @@ fn parse_decl_var<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         tag(Symbol::SemiColon),
     ))
     .parse_once(input)?;
-    let ast = match expr {
-        Expr::Range(range) => Ast::Allocate { name, range },
-        Expr::Move { source } => Ast::Move { name, source },
+    let kind = match expr {
+        Expr::Range(range) => AstKind::Allocate { name, range },
+        Expr::Move { source } => AstKind::Move { name, source },
         Expr::Borrow {
             source,
             is_exclusive,
             read,
             write,
             range,
-        } => Ast::Borrow {
+        } => AstKind::Borrow {
             name,
             source,
             is_exclusive,
@@ -219,7 +260,10 @@ fn parse_decl_var<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         },
     };
 
-    Ok((input, ast))
+    Ok((input, Ast {
+        span: start.start..end.end,
+        kind,
+    }))
 }
 
 fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
@@ -227,7 +271,7 @@ fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) ->
         map(parse_range, Expr::Range),
         map(
             all((
-                IDENT,
+                map(IDENT, |(_, name)| name),
                 opt(all((
                     tag(Symbol::Borrow),
                     parse_modifier,
@@ -288,5 +332,5 @@ pub fn parse_range<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Range<Option<u32>>, E> {
     let (input, (start, _sym_dot2, end)) = all((opt(NUM), tag(Symbol::Dot2), opt(NUM))).parse_once(input)?;
-    Ok((input, start..end))
+    Ok((input, start.map(|(_, start)| start)..end.map(|(_, end)| end)))
 }
