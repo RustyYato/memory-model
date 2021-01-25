@@ -51,7 +51,7 @@ pub trait PointerMap {
     ) -> Result<(), E>;
 }
 
-pub trait Metadata: Copy + Eq + fmt::Debug {
+pub trait Metadata: Copy + Eq {
     type Filter;
 
     fn alloc() -> Self;
@@ -59,6 +59,16 @@ pub trait Metadata: Copy + Eq + fmt::Debug {
     fn filter_all() -> Self::Filter;
 
     fn does_invalidate(self, other: Self, filter: &mut Self::Filter) -> bool;
+}
+
+impl Metadata for () {
+    type Filter = ();
+
+    fn alloc() -> Self {}
+
+    fn filter_all() -> Self::Filter {}
+
+    fn does_invalidate(self, (): Self, (): &mut Self::Filter) -> bool { false }
 }
 
 impl PointerMap for Vec<Stack> {
@@ -217,7 +227,7 @@ pub enum Error {
     },
 }
 
-impl<D: Copy + fmt::Debug> PointerStore<D> {
+impl<D: Copy> PointerStore<D> {
     fn new() -> Self {
         Self {
             counters: Default::default(),
@@ -248,7 +258,8 @@ impl<D: Copy + fmt::Debug> PointerStore<D> {
         let old_id = *id;
         if info.copies != 1 {
             info.copies -= 1;
-            let info = info.clone();
+            let mut info = info.clone();
+            info.copies = 1;
             *id = u32::try_from(self.ptr_info.insert(info)).expect("Tried to create too many pointers");
         }
         Ok((old_id, *id, &mut self.ptr_info[*id as usize]))
@@ -412,7 +423,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
     pub fn update_meta(&mut self, ptr: Pointer, f: impl FnOnce(D) -> D) -> Result {
         check_dealloc!(self, ptr);
 
-        let (id, info) = self.store.get_mut(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
         let old_meta = info.meta;
         let meta = f(info.meta);
 
@@ -421,19 +432,15 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         }
 
         if info.copies != 1 && old_meta.does_invalidate(meta, &mut D::filter_all()) {
-            check_range!(self, ptr);
+            check_range!(self, ptr, Some(info.range.clone()));
 
-            let info = &mut self.store.ptr_info[id as usize];
-            info.copies -= 1;
-            let mut info = info.clone();
-            info.copies = 1;
+            let (old_id, id, info) = self.store.make_exclusive(ptr).unwrap();
             let range = info.range.clone();
-            let new_id = self.store.alloc(ptr, info);
 
             self.memory
                 .for_each(range.clone(), &mut self.stack_recycler, |Stack(byte)| {
-                    let pos = search(ptr, id, byte, &range)?;
-                    byte.insert(pos + 1, new_id);
+                    let pos = search(ptr, old_id, byte, &range).unwrap();
+                    byte.insert(pos + 1, id);
                     Ok(false)
                 })?
         }
@@ -489,6 +496,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let (old_id, id, info) = self.store.make_exclusive(ptr)?;
         info.ptr_ty = PtrType::Exclusive;
         let info = &self.store.ptr_info[id as usize];
+
         self.memory
             .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
                 let pos = search(ptr, old_id, byte, &info.range).unwrap();
@@ -503,11 +511,13 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         check_range!(self, ptr);
 
         let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+
         self.memory
             .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
                 search(ptr, id, byte, &info.range).unwrap();
                 Ok(false)
             })?;
+
         let (_, info) = self.store.get_mut(ptr).unwrap();
         info.ptr_ty = PtrType::Shared;
         self.assert_shared(ptr, D::filter_all())?;
@@ -528,6 +538,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         self.memory
             .for_each(info.range.clone(), &mut self.stack_recycler, |Stack(byte)| {
                 let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
+
                 let offset = byte[pos..].iter().position(|&id| {
                     let info = &ptr_info[id as usize];
                     info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
