@@ -36,6 +36,10 @@ impl<T: Recycle> Drop for AutoCollect<'_, T> {
     fn drop(&mut self) { self.0.put(std::mem::take(&mut self.1)) }
 }
 
+impl<T: Recycle> AutoCollect<'_, T> {
+    pub fn take(mut self) -> T { std::mem::take(&mut self.1) }
+}
+
 impl<T: Recycle> Eq for Empty<T> {}
 impl<T: Recycle> PartialEq for Empty<T> {
     fn eq(&self, other: &Self) -> bool { self.0.size() == other.0.size() }
