@@ -154,6 +154,7 @@ pub enum Error {
     NotExclusive(Pointer),
     NotShared(Pointer),
     DeallocateNonOwning(Pointer),
+    InvalidatesOldMeta(Pointer),
     AllocateRangeOccupied {
         ptr: Pointer,
         range: Range<u32>,
@@ -193,8 +194,33 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
     pub fn info(&self, ptr: Pointer) -> Option<&PointerInfo<D>> { self.ptr_info.get(&ptr) }
 
-    pub fn meta_mut(&mut self, ptr: Pointer) -> Option<&mut D> {
-        self.ptr_info.get_mut(&ptr).map(|info| &mut info.meta)
+    pub fn update_meta(&mut self, ptr: Pointer, f: impl FnOnce(D) -> D) -> Result {
+        if self.deallocated.contains(&ptr) {
+            return Err(Error::UseAfterFree(ptr))
+        }
+
+        let info = self.ptr_info.get_mut(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let old_meta = info.meta;
+        let meta = f(info.meta);
+        if meta.does_invalidate(old_meta, &mut D::filter_all()) {
+            return Err(Error::InvalidatesOldMeta(ptr))
+        }
+        info.meta = meta;
+        if old_meta.does_invalidate(meta, &mut D::filter_all()) {
+            let copy_id = info.copy_id;
+            let range = info.range.clone();
+            self.copies[copy_id as usize] -= 1;
+            info.copy_id = self.copies.insert(1) as u32;
+            let ptr_info = &self.ptr_info;
+            self.memory.for_each(range.clone(), &mut self.vec_recycler, |byte| {
+                let (pos, _, copy_block_end) = search(ptr, copy_id, byte, &range, ptr_info)?;
+                let copy_block_end = copy_block_end();
+                byte.swap(pos, copy_block_end);
+                Ok(false)
+            })?
+        }
+
+        OK
     }
 
     pub fn is_deallocated(&self, ptr: Pointer) -> bool { self.deallocated.contains(&ptr) }
@@ -250,15 +276,8 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let ptr_info = &self.ptr_info;
         let copy_id = ptr_info[&source].copy_id;
         self.memory.for_each(range, &mut self.vec_recycler, |byte| {
-            let pos =
-                1 + byte
-                    .iter()
-                    .rposition(|ptr| ptr_info[ptr].copy_id == copy_id)
-                    .ok_or(Error::InvalidForRange {
-                        ptr: source,
-                        range: source_range.clone(),
-                    })?;
-
+            let (pos, _, _) = search(source, copy_id, byte, &source_range, ptr_info)?;
+            let pos = pos + 1;
             let offset = byte[pos..].iter().position(|ptr| {
                 let info = &ptr_info[ptr];
                 info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
@@ -280,15 +299,8 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let ptr_info = &self.ptr_info;
         let copy_id = ptr_info[&source].copy_id;
         self.memory.for_each(range, &mut self.vec_recycler, |byte| {
-            let pos =
-                1 + byte
-                    .iter()
-                    .rposition(|ptr| ptr_info[ptr].copy_id == copy_id)
-                    .ok_or(Error::InvalidForRange {
-                        ptr: source,
-                        range: source_range.clone(),
-                    })?;
-            byte.truncate(pos);
+            let (pos, _, _) = search(source, copy_id, byte, &source_range, ptr_info)?;
+            byte.truncate(pos + 1);
             byte.push(ptr);
             Ok(false)
         })
@@ -372,13 +384,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let ptr_info = &self.ptr_info;
         let copy_id = ptr_info[&source].copy_id;
         self.memory.for_each(range.clone(), &mut self.vec_recycler, |byte| {
-            let pos = byte
-                .iter()
-                .position(|ptr| ptr_info[ptr].copy_id == copy_id)
-                .ok_or(Error::InvalidForRange {
-                    ptr: source,
-                    range: range.clone(),
-                })?;
+            let (pos, _, _) = search(source, copy_id, byte, &range, ptr_info)?;
             byte.insert(pos, ptr);
             Ok(false)
         })
@@ -453,12 +459,8 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let copy_id = ptr_info[&ptr].copy_id;
         self.memory
             .for_each(info.range.clone(), &mut self.vec_recycler, |byte| {
-                let pos = 1 + byte.iter().rposition(|ptr| ptr_info[ptr].copy_id == copy_id).ok_or(
-                    Error::InvalidForRange {
-                        ptr,
-                        range: info.range.clone(),
-                    },
-                )?;
+                let (pos, _, _) = search(ptr, copy_id, byte, &info.range, ptr_info)?;
+                let pos = pos + 1;
                 let offset = byte[pos..].iter().position(|packed_ptr| {
                     let info = &ptr_info[packed_ptr];
                     info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
@@ -486,20 +488,42 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let copy_id = ptr_info[&ptr].copy_id;
         self.memory
             .for_each(info.range.clone(), &mut self.vec_recycler, |byte| {
-                let this_pos = byte
-                    .iter()
-                    .rposition(|byte| *byte == ptr)
-                    .ok_or(Error::InvalidForRange {
-                        ptr,
-                        range: info.range.clone(),
-                    })?;
-                let pos = byte[..=this_pos]
-                    .iter()
-                    .rposition(|ptr| ptr_info[ptr].copy_id != copy_id)
-                    .map_or(0, |pos| pos + 1);
-                byte.swap(this_pos, pos);
-                byte.truncate(this_pos + usize::from(keep));
+                let (pos, copy_block_start, _) = search(ptr, copy_id, byte, &info.range, ptr_info)?;
+                let copy_block_start = copy_block_start();
+                byte.swap(pos, copy_block_start);
+                byte.truncate(pos + usize::from(keep));
                 Ok(!keep && byte.is_empty())
             })
     }
+}
+
+fn search<'a, D: Metadata + 'a>(
+    ptr: Pointer,
+    copy_id: u32,
+    byte: &'a [Pointer],
+    range: &Range<u32>,
+    ptr_info: &'a FxHashMap<Pointer, PointerInfo<D>>,
+) -> Result<(usize, impl 'a + FnOnce() -> usize, impl 'a + FnOnce() -> usize)> {
+    let this_pos = byte
+        .iter()
+        .rposition(|byte| *byte == ptr)
+        .ok_or(Error::InvalidForRange {
+            ptr,
+            range: range.clone(),
+        })?;
+    Ok((
+        this_pos,
+        move || {
+            byte[..=this_pos]
+                .iter()
+                .rposition(|ptr| ptr_info[ptr].copy_id != copy_id)
+                .map_or(0, |pos| pos + 1)
+        },
+        move || {
+            byte[this_pos..]
+                .iter()
+                .rposition(|ptr| ptr_info[ptr].copy_id != copy_id)
+                .unwrap_or(byte.len() - 1)
+        },
+    ))
 }
