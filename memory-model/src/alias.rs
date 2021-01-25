@@ -171,7 +171,7 @@ impl Recycle for Stack {
 pub struct MemoryBlock<D, M = BTreePointerMap> {
     memory: M,
     deallocated: FxHashSet<Pointer>,
-    allocations: Slab<Vec<Pointer>>,
+    allocations: Slab<FxHashSet<Pointer>>,
     store: PointerStore<D>,
 }
 
@@ -319,7 +319,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         })?;
 
         let alloc_id =
-            u32::try_from(self.allocations.insert(Vec::new())).expect("Tried to create too many allocations");
+            u32::try_from(self.allocations.insert(FxHashSet::default())).expect("Tried to create too many allocations");
 
         let id = self.store.alloc(ptr, PointerInfo {
             alloc_id,
@@ -370,7 +370,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let source_range = source_info.range.clone();
         let alloc_id = source_info.alloc_id;
 
-        self.allocations[alloc_id as usize].push(ptr);
+        self.allocations[alloc_id as usize].insert(ptr);
         let id = self.store.alloc(ptr, PointerInfo {
             owns_allocation: false,
             copies: 1,
@@ -458,13 +458,13 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         }
 
         info.copies += 1;
-        self.allocations[info.alloc_id as usize].push(ptr);
+        self.allocations[info.alloc_id as usize].insert(ptr);
         self.store.counters.insert(ptr, id);
 
         OK
     }
 
-    pub fn deallocate(&mut self, ptr: Pointer) -> Result<Vec<Pointer>> {
+    pub fn deallocate(&mut self, ptr: Pointer) -> Result<FxHashSet<Pointer>> {
         if !self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?.1.owns_allocation {
             return Err(Error::DeallocateNonOwning(ptr))
         }
@@ -480,7 +480,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             self.deallocated.insert(ptr);
         }
 
-        allocation.push(ptr);
+        allocation.insert(ptr);
 
         Ok(allocation)
     }

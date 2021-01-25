@@ -162,9 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             AstKind::Drop { name } => {
                 let ptr = try_or_throw!(allocator.ptr(name));
-                let mut deallocated = try_or_throw!(model.deallocate(ptr));
-                deallocated.sort_unstable();
-                deallocated.dedup();
+                let deallocated = try_or_throw!(model.deallocate(ptr));
                 for ptr in deallocated {
                     allocator.dealloc(ptr, ast.span.clone());
                 }
