@@ -4,7 +4,7 @@ use std::ops::Range;
 use compiler::ast::Ast;
 use fxhash::FxHashMap;
 use memory_model::{
-    alias::{MemoryBlock, Metadata, PtrType},
+    alias::{Error, MemoryBlock, Metadata, PtrType},
     Pointer,
 };
 
@@ -73,40 +73,103 @@ impl<'a> Allocator<'a> {
     }
 }
 
-fn main() {
+#[cold]
+#[inline(never)]
+fn handle_error<M: memory_model::alias::PointerMap>(
+    err: Error,
+    ast: Ast<'_>,
+    allocator: &Allocator,
+    model: &MemoryBlock<Permissions, M>,
+) -> Box<dyn std::error::Error> {
+    use Error::*;
+    match err {
+        ReborrowInvalidatesSource { ptr, source } => format!(
+            "Could not borrow `{}`, because it invalidated it's source `{}`",
+            allocator.name(ptr),
+            allocator.name(source)
+        )
+        .into(),
+        UseAfterFree(ptr) => format!("Tried to use `{}` after it was freed", allocator.name(ptr)).into(),
+        InvalidPtr(ptr) => format!("Tried to use `{}`, which was never registered", allocator.name(ptr)).into(),
+        NotExclusive(ptr) => format!("Tried to use `{}` exclusively, but it is shared", allocator.name(ptr)).into(),
+        NotShared(ptr) => format!("Tried to use `{}` as shared, but it is exclusive", allocator.name(ptr)).into(),
+        DeallocateNonOwning(ptr) => format!(
+            "Tried to deallocate `{}`, but it doesn't own an allocation",
+            allocator.name(ptr)
+        )
+        .into(),
+        InvalidatesOldMeta(ptr) => format!(
+            "Tried to update the meta data of `{}`, but it would invalidate itself",
+            allocator.name(ptr)
+        )
+        .into(),
+        AllocateRangeOccupied { ptr: _, range } => format!(
+            "Tried to allocate in range {:?}, but that range is already occupied",
+            range
+        )
+        .into(),
+        InvalidForRange { ptr, range } => format!(
+            "Tried to use `{}` for the range {:?}, but it is not valid for that range",
+            allocator.name(ptr),
+            range
+        )
+        .into(),
+        ReborrowSubset {
+            ptr,
+            source,
+            source_range,
+        } => format!(
+            "Tried to reborrow `{}` from `{1}` for the range {2:?}, but `{1}` is not valid for that range",
+            allocator.name(ptr),
+            allocator.name(source),
+            source_range
+        )
+        .into(),
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = std::env::args().nth(1).unwrap();
     let file = std::fs::read_to_string(file).unwrap();
     let (input, tokens) = compiler::tokens::parse::<dec::base::error::DefaultError<_>>(&file).unwrap();
     if !input.is_empty() {
         println!("{}", input);
-        return
+        return Err("Could not parse tokens".into())
     }
     let (input, ast) = compiler::ast::parse::<dec::base::error::DefaultError<_>>(&tokens).unwrap();
     if !input.is_empty() {
         println!("{:#?}", ast);
         println!("{:#?}", input);
-        return
+        return Err("Could not parse ast".into())
     }
 
     let mut allocator = Allocator::default();
     let mut model = MemoryBlock::<_, FxHashMap<_, _>>::with_size(0);
 
     for ast in ast {
-        println!("{:?}", ast);
-        match ast {
+        macro_rules! try_or_throw {
+            ($result:expr) => {
+                match $result {
+                    Ok(x) => x,
+                    Err(e) => return Err(handle_error(e, ast, &allocator, &model)),
+                }
+            };
+        }
+
+        match ast.clone() {
             Ast::Allocate { name, range } => match range {
                 Range {
                     start: Some(start),
                     end: Some(end),
                 } => {
                     let ptr = allocator.alloc(name);
-                    model.allocate(ptr, start..end).unwrap();
+                    try_or_throw!(model.allocate(ptr, start..end));
                 }
                 _ => panic!("range bounds not specified"),
             },
             Ast::Drop { name } => {
                 let ptr = allocator.ptr(name);
-                model.deallocate(ptr).unwrap();
+                try_or_throw!(model.deallocate(ptr));
                 allocator.dealloc(ptr);
             }
             Ast::Borrow {
@@ -120,7 +183,7 @@ fn main() {
                 let ptr = allocator.alloc(name);
                 let source = allocator.ptr(source);
 
-                let info = model.info(source).unwrap();
+                let info = try_or_throw!(model.info(source));
                 let source_range = &info.range;
                 let range = range.unwrap_or(None..None);
                 let start = range.start.unwrap_or(source_range.start);
@@ -134,7 +197,7 @@ fn main() {
                 } else {
                     model.reborrow_shared(ptr, source, range, meta)
                 };
-                res.unwrap();
+                try_or_throw!(res);
             }
             Ast::Update {
                 name,
@@ -148,40 +211,43 @@ fn main() {
                 } else {
                     model.mark_shared(ptr)
                 };
-                res.unwrap();
-                model.update_meta(ptr, |_| Permissions { read, write }).unwrap();
+                try_or_throw!(res);
+                let res = model.update_meta(ptr, |_| Permissions { read, write });
+                try_or_throw!(res);
             }
             Ast::Write { name, is_exclusive } => {
                 let ptr = allocator.ptr(name);
-                assert!(model.info(ptr).unwrap().meta.write);
+                assert!(try_or_throw!(model.info(ptr)).meta.write);
                 let res = if is_exclusive {
                     model.assert_exclusive(ptr)
                 } else {
                     model.assert_shared(ptr, PermissionsFilter::Write)
                 };
-                res.unwrap();
+                try_or_throw!(res);
             }
             Ast::Read { name, is_exclusive } => {
                 let ptr = allocator.ptr(name);
-                assert!(model.info(ptr).unwrap().meta.read);
+                assert!(try_or_throw!(model.info(ptr)).meta.read);
                 let res = if is_exclusive {
                     model.assert_exclusive(ptr)
                 } else {
                     model.assert_shared(ptr, PermissionsFilter::Read)
                 };
-                res.unwrap();
+                try_or_throw!(res);
             }
             Ast::Move { name, source } => {
                 let source_ptr = allocator.ptr(source);
 
-                let info = model.info(source_ptr).unwrap();
+                let info = try_or_throw!(model.info(source_ptr));
                 match info.ptr_ty {
                     PtrType::Exclusive => allocator.rename(source, name),
-                    PtrType::Shared => model.copy(allocator.alloc(name), source_ptr).unwrap(),
+                    PtrType::Shared => try_or_throw!(model.copy(allocator.alloc(name), source_ptr)),
                 }
             }
         }
 
         // println!("{:#?}\n\n", model);
     }
+
+    Ok(())
 }

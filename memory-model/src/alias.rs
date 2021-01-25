@@ -205,7 +205,10 @@ pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub enum Error {
-    ReborrowInvalidatesSource,
+    ReborrowInvalidatesSource {
+        ptr: Pointer,
+        source: Pointer,
+    },
     UseAfterFree(Pointer),
     InvalidPtr(Pointer),
     NotExclusive(Pointer),
@@ -296,7 +299,9 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         }
     }
 
-    pub fn info(&self, ptr: Pointer) -> Option<&PointerInfo<D>> { self.store.get(ptr).map(|(_, info)| info) }
+    pub fn info(&self, ptr: Pointer) -> Result<&PointerInfo<D>> {
+        self.store.get(ptr).map(|(_, info)| info).ok_or(Error::InvalidPtr(ptr))
+    }
 
     pub fn is_deallocated(&self, ptr: Pointer) -> bool { self.deallocated.contains(&ptr) }
 
@@ -367,7 +372,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         }
 
         if meta.does_invalidate(source_info.meta, &mut D::filter_all()) {
-            return Err(Error::ReborrowInvalidatesSource)
+            return Err(Error::ReborrowInvalidatesSource { ptr, source })
         }
 
         let source_range = source_info.range.clone();
