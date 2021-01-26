@@ -94,10 +94,44 @@ fn parse_token_type(mut input: &str) -> PResult<&str, (usize, TokenKind<'_>)> {
         if let Some(new_input) = input.strip_prefix("//") {
             let end = memchr::memchr(b'\n', new_input.as_bytes()).unwrap_or(new_input.len());
             input = &new_input[end..];
-        } else {
-            break
+            continue
         }
+
+        if let Some(stripped_input) = input.strip_prefix("/*") {
+            enum State {
+                PreviousSlash(usize),
+                PreviousAsterix(usize),
+                New,
+            }
+
+            let binput = stripped_input.as_bytes();
+            let comment_segment = memchr::memchr2_iter(b'/', b'*', binput)
+                .try_fold((0_u32, State::New), |(stack, state), pos| {
+                    Ok(match (binput[pos], state) {
+                        (b'/', State::PreviousAsterix(last_pos)) if last_pos + 1 == pos => {
+                            if let Some(stack) = stack.checked_sub(1) {
+                                (stack, State::New)
+                            } else {
+                                return Err(pos + 1)
+                            }
+                        }
+                        (b'/', _) => (stack, State::PreviousSlash(pos)),
+                        (b'*', State::PreviousSlash(last_pos)) if last_pos + 1 == pos => (stack + 1, State::New),
+                        (b'*', _) => (stack, State::PreviousAsterix(pos)),
+                        _ => unreachable!(),
+                    })
+                })
+                .err();
+            input = match comment_segment {
+                Some(pos) => &stripped_input[pos..],
+                None => "",
+            };
+            continue
+        }
+
+        break
     }
+
     let offset = offset - input.len();
 
     match input.split_with(|c: char| !c.is_ascii_digit()) {

@@ -33,18 +33,20 @@ pub enum PermissionsFilter {
     Borrow,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Allocator<'a> {
     name_to_ptr: HashMap<&'a str, Pointer>,
     ptr_to_name: FxHashMap<Pointer, &'a str>,
     invalidated: HashMap<&'a str, Invalidated>,
 }
 
+#[derive(Debug)]
 struct Invalidated {
     span: Range<usize>,
     kind: InvalidKind,
 }
 
+#[derive(Debug)]
 enum InvalidKind {
     Freed,
     Moved,
