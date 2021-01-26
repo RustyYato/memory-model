@@ -1,0 +1,58 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "memory model dsl",
+	"patterns": [
+		{
+			"include": "#func_call"
+		},
+		{
+			"include": "#number"
+		},
+		{
+			"include": "#keywords"
+		},
+		{
+			"include": "#identifier"
+		},
+		{
+			"include": "#comment"
+		}
+	],
+	"repository": {
+		"keywords": {
+			"patterns": [
+				{
+					"name": "keyword.control",
+					"match": "\\b(let|shr|exc|read|write|drop|fn)\\b"
+				},
+				{
+					"name": "keyword.other.unit",
+					"match": "\\b(_)\\b"
+				}
+			]
+		},
+		"number": {
+			"patterns": [
+				{
+					"name": "constant.numeric",
+					"match": "\\b([0-9]+)\\b"
+				}
+			]
+		},
+		"identifier": {
+			"patterns": [
+				{
+					"name": "variable.name",
+					"match": "\\b([\\w_0-9]+)\\b"
+				}
+			]
+		},
+		"comment": {
+			"name": "comment.line.double-dash",
+			"begin": "//",
+			"end": "\n",
+			"match": "//[^\n]*\n"
+		}
+	},
+	"scopeName": "source.mmd"
+}

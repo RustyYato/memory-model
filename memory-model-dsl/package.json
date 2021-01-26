@@ -1,0 +1,29 @@
+{
+    "name": "memory-model-dsl",
+    "publisher": "RustyYato",
+    "repository": {
+        "url": "https://github.com/RustyYato/memory-model"
+    },
+    "displayName": "memory-model-dsl",
+    "description": "a dsl for pointer aliasing and more to help specify memory models",
+    "version": "0.0.1",
+    "engines": {
+        "vscode": "^1.52.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "contributes": {
+        "languages": [{
+            "id": "memmodeldsl",
+            "aliases": ["memory model dsl", "memmodeldsl"],
+            "extensions": [".mmd"],
+            "configuration": "./language-configuration.json"
+        }],
+        "grammars": [{
+            "language": "memmodeldsl",
+            "scopeName": "source.mmd",
+            "path": "./syntaxes/memmodeldsl.tmLanguage.json"
+        }]
+    }
+}
