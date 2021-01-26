@@ -24,6 +24,19 @@ fn span_to_string(span: &Range<usize>, line_offsets: &[usize]) -> String {
     )
 }
 
+struct DisplayToDebug<T>(T);
+
+use std::fmt;
+impl<T: fmt::Display> fmt::Debug for DisplayToDebug<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
+}
+
+impl<T: fmt::Display> fmt::Display for DisplayToDebug<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
+}
+
+impl<T: fmt::Display> std::error::Error for DisplayToDebug<T> {}
+
 #[cold]
 #[inline(never)]
 pub(crate) fn handle_error(
@@ -39,7 +52,7 @@ pub(crate) fn handle_error(
     let err = match err {
         Error::Alias(err) => err,
         Error::InvalidPtr(ptr) => {
-            return match allocator.invalidated.get(ptr) {
+            let err = match allocator.invalidated.get(ptr) {
                 Some(Invalidated {
                     kind: InvalidKind::Freed,
                     span: freed_span,
@@ -48,8 +61,7 @@ pub(crate) fn handle_error(
                     span,
                     ptr = ptr,
                     freed_span = span_to_string(&freed_span, line_offsets)
-                )
-                .into(),
+                ),
                 Some(Invalidated {
                     kind: InvalidKind::Moved,
                     span: moved_span,
@@ -58,64 +70,98 @@ pub(crate) fn handle_error(
                     span,
                     ptr = ptr,
                     moved_span = span_to_string(&moved_span, line_offsets)
-                )
-                .into(),
-                None => format!("{}: Unknown pointer `{}`", span, ptr).into(),
+                ),
+                None => format!("{}: Unknown pointer `{}`", span, ptr),
+            };
+
+            return DisplayToDebug(err).into()
+        }
+
+        Error::NoFunction { func } => return DisplayToDebug(format!("{}: Unkown function {}", span, func)).into(),
+        Error::TypeMismatch { arg, farg } => {
+            let read = ["", " read"];
+            let write = ["", " write"];
+            let modifier = ["shr", "exc"];
+
+            let arg_ty = arg.ty.unwrap();
+            let farg_ty = farg.ty.unwrap();
+
+            match (
+                format_args!(
+                    "@{}{}{}",
+                    modifier[usize::from(arg_ty.is_exclusive)],
+                    read[usize::from(arg_ty.read)],
+                    write[usize::from(arg_ty.write)]
+                ),
+                format_args!(
+                    "@{}{}{}",
+                    modifier[usize::from(farg_ty.is_exclusive)],
+                    read[usize::from(farg_ty.read)],
+                    write[usize::from(farg_ty.write)]
+                ),
+            ) {
+                (arg_ty, farg_ty) => {
+                    return DisplayToDebug(format!(
+                        "\
+{}: Type mismatch: argument `{}` (at {}) didn't match declared argument `{}` (at {}):
+expected `{}`, but got `{}`",
+                        span,
+                        arg.name,
+                        span_to_string(&arg.span, line_offsets),
+                        farg.name,
+                        span_to_string(&farg.span, line_offsets),
+                        farg_ty,
+                        arg_ty,
+                    ))
+                    .into()
+                }
             }
         }
     };
 
-    match err {
+    let err = match err {
         ReborrowInvalidatesSource { ptr, source } => format!(
             "{}: Could not borrow `{}`, because it invalidated it's source `{}`",
             span,
             allocator.name(ptr),
             allocator.name(source)
-        )
-        .into(),
-        UseAfterFree(ptr) => format!("{}: Tried to use `{}` after it was freed", span, allocator.name(ptr)).into(),
+        ),
+        UseAfterFree(ptr) => format!("{}: Tried to use `{}` after it was freed", span, allocator.name(ptr)),
         InvalidPtr(ptr) => format!(
             "{}: Tried to use `{}`, which was never registered",
             span,
             allocator.name(ptr)
-        )
-        .into(),
+        ),
         NotExclusive(ptr) => format!(
             "{}: Tried to use `{}` exclusively, but it is shared",
             span,
             allocator.name(ptr)
-        )
-        .into(),
+        ),
         NotShared(ptr) => format!(
             "{}: Tried to use `{}` as shared, but it is exclusive",
             span,
             allocator.name(ptr)
-        )
-        .into(),
+        ),
         DeallocateNonOwning(ptr) => format!(
             "{}: Tried to deallocate `{}`, but it doesn't own an allocation",
             span,
             allocator.name(ptr)
-        )
-        .into(),
+        ),
         InvalidatesOldMeta(ptr) => format!(
             "{}: Tried to update the meta data of `{}`, but it would invalidate itself",
             span,
             allocator.name(ptr)
-        )
-        .into(),
+        ),
         AllocateRangeOccupied { ptr: _, range } => format!(
             "{}: Tried to allocate in range {:?}, but that range is already occupied",
             span, range
-        )
-        .into(),
+        ),
         InvalidForRange { ptr, range } => format!(
             "{}: Tried to use `{}` for the range {:?}, but it is not valid for that range",
             span,
             allocator.name(ptr),
             range
-        )
-        .into(),
+        ),
         ReborrowSubset {
             ptr,
             source,
@@ -126,7 +172,8 @@ pub(crate) fn handle_error(
             allocator.name(ptr),
             allocator.name(source),
             source_range
-        )
-        .into(),
-    }
+        ),
+    };
+
+    DisplayToDebug(err).into()
 }

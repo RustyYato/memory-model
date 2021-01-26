@@ -8,7 +8,7 @@ use dec::{
     branch::any,
     combinator::opt,
     map::{map, value},
-    seq::all,
+    seq::{all, range, separated},
     tag::tag,
 };
 
@@ -57,6 +57,15 @@ pub enum AstKind<'i> {
     Drop {
         name: &'i str,
     },
+    FuncDecl {
+        name: &'i str,
+        args: Vec<Arg<'i>>,
+        instr: Vec<Ast<'i>>,
+    },
+    FuncCall {
+        name: &'i str,
+        args: Vec<(Range<usize>, &'i str)>,
+    },
 }
 
 enum Expr<'a> {
@@ -71,6 +80,20 @@ enum Expr<'a> {
         write: bool,
         range: Option<Range<Option<u32>>>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct Arg<'a> {
+    pub span: Range<usize>,
+    pub name: &'a str,
+    pub ty: Option<ArgTy>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArgTy {
+    pub is_exclusive: bool,
+    pub read: bool,
+    pub write: bool,
 }
 
 struct Perm {
@@ -173,7 +196,9 @@ pub fn parse_ast<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         parse_drop,
         parse_read,
         parse_write,
+        parse_func_call,
         parse_update,
+        parse_func_decl,
         //
     ))
     .parse_once(input)
@@ -292,6 +317,82 @@ fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) ->
         ),
     ))
     .parse_once(input)
+}
+
+fn parse_func_call<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
+    let (input, ((start, name), _sym_open_paren, args, _sym_close_paren, (end, _sym_semi))) = all((
+        IDENT,
+        tag(Symbol::OpenParen),
+        separated(.., tag(Symbol::Comma), IDENT),
+        tag(Symbol::CloseParen),
+        tag(Symbol::SemiColon),
+    ))
+    .parse_once(input)?;
+
+    Ok((input, Ast {
+        span: start.start..end.end,
+        kind: AstKind::FuncCall { name, args },
+    }))
+}
+
+fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
+    let (
+        input,
+        (
+            (start, _kw_fn),
+            (_, name),
+            _sym_open_paren,
+            args,
+            _sym_close_paren,
+            _sym_open_curly,
+            instr,
+            (end, _sym_close_curly),
+        ),
+    ) = all((
+        tag(Keyword::Fn),
+        IDENT,
+        tag(Symbol::OpenParen),
+        separated(.., tag(Symbol::Comma), parse_arg),
+        tag(Symbol::CloseParen),
+        tag(Symbol::OpenCurly),
+        range(.., parse_ast),
+        tag(Symbol::CloseCurly),
+    ))
+    .parse_once(input)?;
+
+    Ok((input, Ast {
+        span: start.start..end.end,
+        kind: AstKind::FuncDecl { name, args, instr },
+    }))
+}
+
+fn parse_arg<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Arg<'i>, E> {
+    let (input, (span, name)) = IDENT.parse_once(input)?;
+    let (input, type_annotation) = opt(all((
+        tag(Symbol::Colon),
+        tag(Symbol::Borrow),
+        parse_modifier,
+        parse_permissions,
+    )))
+    .parse_once(input)?;
+
+    if let Some((_sym_colon, _sym_borrow, is_exclusive, Perm { read, write })) = type_annotation {
+        Ok((input, Arg {
+            span,
+            name,
+            ty: Some(ArgTy {
+                is_exclusive,
+                read,
+                write,
+            }),
+        }))
+    } else {
+        Ok((input, Arg { span, name, ty: None }))
+    }
 }
 
 fn parse_modifier<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], bool, E> {

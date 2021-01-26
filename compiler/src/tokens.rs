@@ -20,25 +20,21 @@ pub enum TokenKind<'a> {
     Number(u32),
     Symbol(Symbol),
     Keyword(Keyword),
-    Whitespace(Whitespace, &'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Symbol {
     OpenParen,
     CloseParen,
+    OpenCurly,
+    CloseCurly,
     Dot2,
     SemiColon,
     Equal,
     Borrow,
     Arrow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Whitespace {
-    LineComment,
-    BlockComment,
-    Normal,
+    Colon,
+    Comma,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +45,7 @@ pub enum Keyword {
     Read,
     Write,
     Drop,
+    Fn,
 }
 
 pub fn parse<'a, E: ParseError<Input<'a>>>(input: Input<'a>) -> PResult<Input<'a>, Vec<Token<'_>>, E> {
@@ -143,16 +140,17 @@ fn parse_token_type(mut input: &str) -> PResult<&str, (usize, TokenKind<'_>)> {
         ("", _) => (),
         (ident, input) => {
             let tok = match ident {
-                "let" => TokenKind::Keyword(Keyword::Let),
-                "shr" => TokenKind::Keyword(Keyword::Shared),
-                "exc" => TokenKind::Keyword(Keyword::Exclusive),
-                "read" => TokenKind::Keyword(Keyword::Read),
-                "write" => TokenKind::Keyword(Keyword::Write),
-                "drop" => TokenKind::Keyword(Keyword::Drop),
-                _ => TokenKind::Ident(ident),
+                "let" => Keyword::Let,
+                "shr" => Keyword::Shared,
+                "exc" => Keyword::Exclusive,
+                "read" => Keyword::Read,
+                "write" => Keyword::Write,
+                "drop" => Keyword::Drop,
+                "fn" => Keyword::Fn,
+                _ => return Ok((input, (offset, TokenKind::Ident(ident)))),
             };
 
-            return Ok((input, (offset, tok)))
+            return Ok((input, (offset, TokenKind::Keyword(tok))))
         }
     }
 
@@ -165,13 +163,17 @@ fn parse_token_type(mut input: &str) -> PResult<&str, (usize, TokenKind<'_>)> {
     }
 
     let kind = match input.get(0..1) {
-        Some("(") => TokenKind::Symbol(Symbol::OpenParen),
-        Some(")") => TokenKind::Symbol(Symbol::CloseParen),
-        Some(";") => TokenKind::Symbol(Symbol::SemiColon),
-        Some("=") => TokenKind::Symbol(Symbol::Equal),
-        Some("@") => TokenKind::Symbol(Symbol::Borrow),
+        Some("(") => Symbol::OpenParen,
+        Some(")") => Symbol::CloseParen,
+        Some("{") => Symbol::OpenCurly,
+        Some("}") => Symbol::CloseCurly,
+        Some(";") => Symbol::SemiColon,
+        Some(":") => Symbol::Colon,
+        Some(",") => Symbol::Comma,
+        Some("=") => Symbol::Equal,
+        Some("@") => Symbol::Borrow,
         _ => return Err(Error::Error((input, ErrorKind::Custom("no token found")))),
     };
 
-    Ok((&input[1..], (offset, kind)))
+    Ok((&input[1..], (offset, TokenKind::Symbol(kind))))
 }

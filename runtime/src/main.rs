@@ -1,19 +1,23 @@
+#![feature(drain_filter)]
+
 use std::ops::Range;
 
-use compiler::ast::AstKind;
+use compiler::ast::{Arg, ArgTy, Ast, AstKind};
 use fxhash::FxHashMap;
 use memory_model::{
     alias::{MemoryBlock, Metadata, PtrType},
     Pointer,
 };
 
-use hashbrown::HashMap;
+use hashbrown::{hash_map::Entry, HashMap};
 
 mod error;
 
 enum Error<'a> {
     Alias(memory_model::alias::Error),
     InvalidPtr(&'a str),
+    TypeMismatch { arg: Arg<'a>, farg: Arg<'a> },
+    NoFunction { func: &'a str },
 }
 
 impl From<memory_model::alias::Error> for Error<'_> {
@@ -31,6 +35,21 @@ pub enum PermissionsFilter {
     Read,
     Write,
     Borrow,
+}
+
+type State = MemoryBlock<Permissions, memory_model::alias::HashPointerMap<fxhash::FxBuildHasher>>;
+type FunctionMap<'a> = HashMap<&'a str, Function<'a>>;
+
+struct Function<'a> {
+    args: Vec<Arg<'a>>,
+    map: FunctionMap<'a>,
+    instrs: Vec<Ast<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct FunctionMapRef<'m, 'a> {
+    parent: Option<&'m FunctionMapRef<'m, 'a>>,
+    inner: &'m FunctionMap<'a>,
 }
 
 #[derive(Default, Debug)]
@@ -83,12 +102,13 @@ impl<'a> Allocator<'a> {
     }
 
     fn dealloc(&mut self, ptr: Pointer, span: Range<usize>) {
-        let name = self.ptr_to_name.remove(&ptr).unwrap();
-        self.invalidated.insert(name, Invalidated {
-            span,
-            kind: InvalidKind::Freed,
-        });
-        self.name_to_ptr.remove(name);
+        if let Some(name) = self.ptr_to_name.remove(&ptr) {
+            self.invalidated.insert(name, Invalidated {
+                span,
+                kind: InvalidKind::Freed,
+            });
+            self.name_to_ptr.remove(name);
+        }
     }
 
     fn name(&self, ptr: Pointer) -> &'a str { self.ptr_to_name[&ptr] }
@@ -124,17 +144,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", input.inner());
         return Err("Could not parse tokens".into())
     }
-    let (input, ast) = compiler::ast::parse::<dec::base::error::DefaultError<_>>(&tokens).unwrap();
+    let (input, mut instrs) = compiler::ast::parse::<dec::base::error::verbose::VerboseError<_>>(&tokens).unwrap();
     if !input.is_empty() {
-        println!("{:#?}", ast);
+        println!("{:#?}", instrs);
         println!("{:#?}", input);
         return Err("Could not parse ast".into())
     }
 
+    let mut model = State::with_size(0);
     let mut allocator = Allocator::default();
-    let mut model = MemoryBlock::<_, memory_model::alias::HashPointerMap<fxhash::FxBuildHasher>>::with_size(0);
+    let map = build_function_map(&mut instrs);
+    let map = FunctionMapRef {
+        inner: &map,
+        parent: None,
+    };
 
-    for ast in ast {
+    run(&instrs, &line_offsets, map, &mut model, &mut allocator)
+}
+
+fn build_function_map<'a>(instrs: &mut Vec<Ast<'a>>) -> FunctionMap<'a> {
+    let mut map = FunctionMap::default();
+    let drain = instrs.drain_filter(|ast| matches!(ast.kind, AstKind::FuncDecl { .. }));
+
+    for func_decl in drain {
+        let (name, args, mut instrs) = match func_decl.kind {
+            AstKind::FuncDecl { name, args, instr } => (name, args, instr),
+            _ => unreachable!(),
+        };
+
+        match map.entry(name) {
+            Entry::Vacant(entry) => {
+                entry.insert(Function {
+                    args,
+                    map: build_function_map(&mut instrs),
+                    instrs,
+                });
+            }
+            Entry::Occupied(_) => panic!("function {} was declared twice!", name),
+        }
+    }
+
+    map
+}
+
+fn run<'a>(
+    instrs: &[Ast<'a>],
+    line_offsets: &[usize],
+    map: FunctionMapRef<'_, 'a>,
+    model: &mut State,
+    allocator: &mut Allocator<'a>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for ast in instrs {
         macro_rules! try_or_throw {
             ($result:expr) => {
                 match $result {
@@ -142,9 +202,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => {
                         return Err(error::handle_error(
                             Error::from(e),
-                            ast.span,
-                            &allocator,
-                            &line_offsets,
+                            ast.span.clone(),
+                            allocator,
+                            line_offsets,
+                        ))
+                    }
+                }
+            };
+            ($result:expr, span = $span:expr) => {
+                match $result {
+                    Ok(x) => x,
+                    Err(e) => {
+                        return Err(error::handle_error(
+                            Error::from(e),
+                            $span,
+                            allocator,
+                            line_offsets,
                         ))
                     }
                 }
@@ -152,7 +225,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         match ast.kind {
-            AstKind::Allocate { name, range } => match range {
+            AstKind::FuncDecl { .. } => (),
+            AstKind::Allocate { name, ref range } => match *range {
                 Range {
                     start: Some(start),
                     end: Some(end),
@@ -173,16 +247,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name,
                 source,
                 is_exclusive,
-                range,
+                ref range,
                 read,
                 write,
             } => {
-                let ptr = allocator.alloc(name);
                 let source = try_or_throw!(allocator.ptr(source));
+                let ptr = allocator.alloc(name);
 
                 let info = try_or_throw!(model.info(source));
                 let source_range = &info.range;
-                let range = range.unwrap_or(None..None);
+                let range = range.clone().unwrap_or(None..None);
                 let start = range.start.unwrap_or(source_range.start);
                 let end = range.end.unwrap_or(source_range.end);
                 let range = start..end;
@@ -242,8 +316,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let info = try_or_throw!(model.info(source_ptr));
                 match info.ptr_ty {
                     PtrType::Exclusive => allocator.rename(source, name),
-                    PtrType::Shared => try_or_throw!(model.copy(allocator.alloc(name), source_ptr)),
+                    PtrType::Shared => {
+                        let ptr = allocator.alloc(name);
+                        try_or_throw!(model.copy(ptr, source_ptr))
+                    }
                 }
+            }
+            AstKind::FuncCall { name, ref args } => {
+                let mut map_ = &map;
+                let func = loop {
+                    if let Some(func) = map_.inner.get(name) {
+                        break func
+                    }
+
+                    match map_.parent {
+                        Some(parent) => map_ = parent,
+                        None => try_or_throw!(Err(Error::NoFunction { func: name })),
+                    }
+                };
+                let map = FunctionMapRef {
+                    inner: &func.map,
+                    parent: Some(&map),
+                };
+                let instrs = &*func.instrs;
+
+                assert_eq!(args.len(), func.args.len());
+
+                for (farg, &(ref span, arg)) in func.args.iter().zip(args.iter()) {
+                    let ty = match farg.ty {
+                        Some(ref ty) => ty,
+                        None => continue,
+                    };
+
+                    let perm = Permissions {
+                        read: ty.read,
+                        write: ty.write,
+                    };
+
+                    let ptr = try_or_throw!(allocator.ptr(arg));
+                    let info = try_or_throw!(model.info(ptr));
+                    let is_exclusive = matches!(info.ptr_ty, memory_model::alias::PtrType::Exclusive);
+                    if info.meta == perm && is_exclusive == ty.is_exclusive {
+                        continue
+                    }
+
+                    try_or_throw!(
+                        Err(Error::TypeMismatch {
+                            arg: Arg {
+                                name: arg,
+                                span: span.clone(),
+                                ty: Some(ArgTy {
+                                    is_exclusive,
+                                    read: info.meta.read,
+                                    write: info.meta.write,
+                                })
+                            },
+                            farg: farg.clone(),
+                        }),
+                        span = span.clone()
+                    );
+                }
+
+                let mut func_allocator = Allocator::default();
+
+                for (farg, &(ref span, arg)) in func.args.iter().zip(args.iter()) {
+                    let name = farg.name;
+                    let source = arg;
+                    let span = span.clone();
+
+                    let source_ptr = try_or_throw!(allocator.ptr(source), span = span);
+                    allocator.invalidated.insert(source, Invalidated {
+                        span: ast.span.clone(),
+                        kind: InvalidKind::Moved,
+                    });
+
+                    let info = try_or_throw!(model.info(source_ptr), span = span);
+                    match info.ptr_ty {
+                        PtrType::Exclusive => {
+                            let ptr = allocator.name_to_ptr.remove(source).unwrap();
+                            allocator.ptr_to_name.remove(&ptr);
+
+                            func_allocator.name_to_ptr.insert(name, ptr);
+                            func_allocator.ptr_to_name.insert(ptr, name);
+                        }
+                        PtrType::Shared => {
+                            let ptr = func_allocator.alloc(name);
+                            try_or_throw!(model.copy(ptr, source_ptr), span = span)
+                        }
+                    }
+                }
+
+                run(instrs, line_offsets, map, model, &mut func_allocator)?;
             }
         }
 
