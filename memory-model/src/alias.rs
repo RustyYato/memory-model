@@ -25,7 +25,7 @@ macro_rules! check_dealloc {
 macro_rules! check_range {
     ($self:expr, $ptr:expr, $range:expr) => {{
         let ptr = $ptr;
-        let (id, info) = $self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let (id, info) = $self.store.get(ptr)?;
         let range = $range.unwrap_or_else(|| info.range.clone());
         $self.memory.for_each(range.clone(), |Stack(byte)| {
             search(ptr, id, byte, &range).map(|_| false)
@@ -184,10 +184,10 @@ struct PointerStore<D> {
 #[derive(Debug, Clone)]
 pub struct PointerInfo<D> {
     copies: u32,
+    pub owns_allocation: bool,
     pub alloc_id: u32,
     pub range: Range<u32>,
     pub ptr_ty: PtrType,
-    pub owns_allocation: bool,
     pub meta: D,
 }
 
@@ -241,15 +241,21 @@ impl<D: Copy> PointerStore<D> {
         id
     }
 
-    fn drop(&mut self, ptr: Pointer) -> Result<Option<PointerInfo<D>>> {
+    fn dealloc(&mut self, ptr: Pointer) -> Result<PointerInfo<D>> {
         let id = self.counters.remove(&ptr).ok_or(Error::InvalidPtr(ptr))?;
         let info = &mut self.ptr_info[id as usize];
         info.copies -= 1;
+        Ok(self.ptr_info.remove(id as usize))
+    }
+
+    fn drop(&mut self, ptr: Pointer) -> Result<()> {
+        let id = self.counters.remove(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let info = self.ptr_info.get_mut(id as usize).ok_or(Error::InvalidPtr(ptr))?;
+        info.copies -= 1;
         if info.copies == 0 {
-            Ok(Some(self.ptr_info.remove(id as usize)))
-        } else {
-            Ok(None)
+            self.ptr_info.remove(id as usize);
         }
+        Ok(())
     }
 
     fn make_exclusive(&mut self, ptr: Pointer) -> Result<(u32, u32, &mut PointerInfo<D>)> {
@@ -265,14 +271,14 @@ impl<D: Copy> PointerStore<D> {
         Ok((old_id, *id, &mut self.ptr_info[*id as usize]))
     }
 
-    fn get(&self, ptr: Pointer) -> Option<(u32, &PointerInfo<D>)> {
-        let id = *self.counters.get(&ptr)?;
-        Some((id, &self.ptr_info[id as usize]))
+    fn get(&self, ptr: Pointer) -> Result<(u32, &PointerInfo<D>)> {
+        let id = *self.counters.get(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        Ok((id, &self.ptr_info[id as usize]))
     }
 
-    fn get_mut(&mut self, ptr: Pointer) -> Option<(u32, &mut PointerInfo<D>)> {
-        let id = *self.counters.get(&ptr)?;
-        Some((id, &mut self.ptr_info[id as usize]))
+    fn get_mut(&mut self, ptr: Pointer) -> Result<(u32, &mut PointerInfo<D>)> {
+        let id = *self.counters.get(&ptr).ok_or(Error::InvalidPtr(ptr))?;
+        Ok((id, &mut self.ptr_info[id as usize]))
     }
 }
 
@@ -294,9 +300,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         }
     }
 
-    pub fn info(&self, ptr: Pointer) -> Result<&PointerInfo<D>> {
-        self.store.get(ptr).map(|(_, info)| info).ok_or(Error::InvalidPtr(ptr))
-    }
+    pub fn info(&self, ptr: Pointer) -> Result<&PointerInfo<D>> { self.store.get(ptr).map(|(_, info)| info) }
 
     pub fn is_deallocated(&self, ptr: Pointer) -> bool { self.deallocated.contains(&ptr) }
 
@@ -324,9 +328,9 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let id = self.store.alloc(ptr, PointerInfo {
             alloc_id,
             copies: 1,
-            owns_allocation: true,
             meta: D::alloc(),
             ptr_ty: PtrType::Exclusive,
+            owns_allocation: true,
             range: range.clone(),
         });
 
@@ -353,7 +357,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
         check_range!(self, source, Some(range.clone()));
 
-        let (source_id, source_info) = self.store.get(source).ok_or(Error::InvalidPtr(source))?;
+        let (source_id, source_info) = self.store.get(source)?;
 
         if !(source_info.range.start <= range.start && range.end <= source_info.range.end) {
             return Err(Error::ReborrowSubset {
@@ -420,7 +424,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
     pub fn update_meta(&mut self, ptr: Pointer, f: impl FnOnce(D) -> D) -> Result {
         check_dealloc!(self, ptr);
 
-        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let (id, info) = self.store.get(ptr)?;
         let old_meta = info.meta;
         let meta = f(info.meta);
 
@@ -451,7 +455,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         check_dealloc!(self, source);
         check_dealloc!(self, ptr);
 
-        let (id, info) = self.store.get_mut(source).ok_or(Error::InvalidPtr(source))?;
+        let (id, info) = self.store.get_mut(source)?;
 
         if info.ptr_ty != PtrType::Shared {
             return Err(Error::NotShared(source))
@@ -465,13 +469,11 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
     }
 
     pub fn deallocate(&mut self, ptr: Pointer) -> Result<FxHashSet<Pointer>> {
-        if !self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?.1.owns_allocation {
+        if !self.store.get(ptr)?.1.owns_allocation {
             return Err(Error::DeallocateNonOwning(ptr))
         }
 
-        self.assert_exclusive_inner(ptr, false)?;
-
-        let info = self.store.drop(ptr)?.unwrap();
+        let info = self.store.dealloc(ptr)?;
         self.deallocated.insert(ptr);
         let mut allocation = self.allocations.remove(info.alloc_id as usize);
 
@@ -492,9 +494,10 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let (old_id, id, info) = self.store.make_exclusive(ptr)?;
         info.ptr_ty = PtrType::Exclusive;
         let info = &self.store.ptr_info[id as usize];
+        let range = &info.range;
 
-        self.memory.for_each(info.range.clone(), |Stack(byte)| {
-            let pos = search(ptr, old_id, byte, &info.range).unwrap();
+        self.memory.for_each(range.clone(), |Stack(byte)| {
+            let pos = search(ptr, old_id, byte, range).unwrap();
             byte.truncate(pos);
             byte.push(id);
             Ok(false)
@@ -505,7 +508,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         check_dealloc!(self, ptr);
         check_range!(self, ptr);
 
-        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let (id, info) = self.store.get(ptr)?;
 
         self.memory.for_each(info.range.clone(), |Stack(byte)| {
             search(ptr, id, byte, &info.range).unwrap();
@@ -525,7 +528,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         check_range!(self, ptr);
 
         let filter = &mut filter;
-        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let (id, info) = self.store.get(ptr)?;
         let ptr_info = &self.store.ptr_info;
         let meta = info.meta;
 
@@ -549,7 +552,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         check_dealloc!(self, ptr);
         check_range!(self, ptr);
 
-        let (id, info) = self.store.get(ptr).ok_or(Error::InvalidPtr(ptr))?;
+        let (id, info) = self.store.get(ptr)?;
 
         if info.ptr_ty != PtrType::Exclusive {
             return Err(Error::NotExclusive(ptr))
