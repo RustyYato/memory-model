@@ -2,10 +2,10 @@
 
 use std::ops::Range;
 
-use compiler::ast::{Arg, ArgTy, Ast, AstKind};
+use compiler::ast::{Arg, ArgTy, Ast, AstKind, Attribute};
 use fxhash::FxHashMap;
 use memory_model::{
-    alias::{MemoryBlock, Metadata, PtrType},
+    alias::{Event, MemoryBlock, Metadata, PtrType, Tracker},
     Pointer,
 };
 
@@ -18,6 +18,7 @@ enum Error<'a> {
     InvalidPtr(&'a str),
     TypeMismatch { arg: Arg<'a>, farg: Arg<'a> },
     NoFunction { func: &'a str },
+    NoAttribute { attr: Attribute<'a> },
 }
 
 impl From<memory_model::alias::Error> for Error<'_> {
@@ -37,7 +38,7 @@ pub enum PermissionsFilter {
     Borrow,
 }
 
-type State = MemoryBlock<Permissions, memory_model::alias::HashPointerMap<fxhash::FxBuildHasher>>;
+type State<'env> = MemoryBlock<'env, Permissions, memory_model::alias::HashPointerMap<fxhash::FxBuildHasher>>;
 type FunctionMap<'a> = HashMap<&'a str, Function<'a>>;
 
 struct Function<'a> {
@@ -191,7 +192,7 @@ fn run<'a>(
     instrs: &[Ast<'a>],
     line_offsets: &[usize],
     map: FunctionMapRef<'_, 'a>,
-    model: &mut State,
+    model: &mut State<'a>,
     allocator: &mut Allocator<'a>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for ast in instrs {
@@ -224,6 +225,20 @@ fn run<'a>(
             };
         }
 
+        let mut should_track = false;
+        for attr in ast.attrs.iter() {
+            match attr.path {
+                "track" => {
+                    should_track = true;
+                }
+                _ => try_or_throw!(Err(Error::NoAttribute { attr: attr.clone() })),
+            }
+        }
+
+        let event_handler = event_handler(&ast.span, line_offsets);
+
+        println!("execute {}", Span::new(&ast.span, line_offsets));
+
         match ast.kind {
             AstKind::FuncDecl { .. } => (),
             AstKind::Allocate { name, ref range } => match *range {
@@ -233,6 +248,16 @@ fn run<'a>(
                 } => {
                     let ptr = allocator.alloc(name);
                     try_or_throw!(model.allocate(ptr, start..end));
+
+                    if should_track {
+                        eprintln!(
+                            "{}: allocated `{}` as {:?}",
+                            ShowSpan(&ast.span, line_offsets),
+                            name,
+                            ptr
+                        );
+                        model.trackers.push(Tracker::new(name, ptr, event_handler.clone()))
+                    }
                 }
                 _ => panic!("range bounds not specified"),
             },
@@ -251,6 +276,7 @@ fn run<'a>(
                 read,
                 write,
             } => {
+                let source_name = source;
                 let source = try_or_throw!(allocator.ptr(source));
                 let ptr = allocator.alloc(name);
 
@@ -269,6 +295,19 @@ fn run<'a>(
                     model.reborrow_shared(ptr, source, range, meta)
                 };
                 try_or_throw!(res);
+
+                if should_track {
+                    eprintln!(
+                        "{}: {} borrow `{}` as {:?} from `{}` ({:?})",
+                        ShowSpan(&ast.span, line_offsets),
+                        if is_exclusive { "exclusive" } else { "shared" },
+                        name,
+                        ptr,
+                        source_name,
+                        source,
+                    );
+                    model.trackers.push(Tracker::new(name, ptr, event_handler))
+                }
             }
             AstKind::Update {
                 name,
@@ -409,9 +448,60 @@ fn run<'a>(
                 run(instrs, line_offsets, map, model, &mut func_allocator)?;
             }
         }
-
-        // println!("{:#?}\n\n", model);
     }
 
     Ok(())
+}
+
+fn event_handler(span: &Range<usize>, line_offsets: &[usize]) -> impl FnMut(&str, Pointer, Event) + Clone + Send {
+    let span = Span::new(span, line_offsets);
+    move |tag: &str, ptr: Pointer, event: Event| println!("{:?}: {:?} ({})", event, ptr, tag)
+}
+
+struct ShowSpan<'a>(pub &'a Range<usize>, pub &'a [usize]);
+#[derive(Clone, Copy)]
+struct Span {
+    line_start: usize,
+    col_start: usize,
+    line_end: usize,
+    col_end: usize,
+}
+
+impl Span {
+    fn new(span: &Range<usize>, line_offsets: &[usize]) -> Self {
+        let line_start = match line_offsets.binary_search(&span.start) {
+            Ok(x) => x,
+            Err(x) => x - 1,
+        };
+        let line_end = match line_offsets.binary_search(&span.end) {
+            Ok(x) => x,
+            Err(x) => x - 1,
+        };
+
+        let col_start = span.start - line_offsets[line_start];
+        let col_end = span.end - line_offsets[line_end];
+
+        Self {
+            line_start: 1 + line_start,
+            col_start: 1 + col_start,
+            line_end: 1 + line_end,
+            col_end: 1 + col_end,
+        }
+    }
+}
+
+use std::fmt;
+
+impl fmt::Display for ShowSpan<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { Span::new(self.0, self.1).fmt(f) }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "span({}:{}..{}:{})",
+            self.line_start, self.col_start, self.line_end, self.col_end
+        )
+    }
 }

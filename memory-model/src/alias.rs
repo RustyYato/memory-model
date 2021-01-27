@@ -9,6 +9,8 @@ use std::{
 use fxhash::{FxHashMap, FxHashSet};
 use slab::Slab;
 
+use sync_wrapper::SyncWrapper;
+
 use crate::{
     recycle::{Recycle, Recycler},
     Pointer,
@@ -27,7 +29,7 @@ macro_rules! check_range {
         let ptr = $ptr;
         let (id, info) = $self.store.get(ptr)?;
         let range = $range.unwrap_or_else(|| info.range.clone());
-        $self.memory.for_each(range.clone(), |Stack(byte)| {
+        $self.memory.for_each(range.clone(), |_, Stack(byte)| {
             search(ptr, id, byte, &range).map(|_| false)
         })?
     }};
@@ -41,7 +43,7 @@ pub trait PointerMap {
 
     fn size(&self) -> Option<u32>;
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, f: F) -> Result<(), E>;
+    fn for_each<E, F: FnMut(u32, &mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, f: F) -> Result<(), E>;
 }
 
 pub trait Metadata: Copy + Eq {
@@ -90,10 +92,16 @@ impl PointerMap for FixedSizePointerMap {
 
     fn size(&self) -> Option<u32> { Some(self.inner.len() as u32) }
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, mut f: F) -> Result<(), E> {
-        let range = range.start as usize..range.end as usize;
-        for byte in &mut self.inner[range] {
-            f(byte)?;
+    fn for_each<E, F: FnMut(u32, &mut Stack) -> Result<bool, E>>(
+        &mut self,
+        range: Range<u32>,
+        mut f: F,
+    ) -> Result<(), E> {
+        for (byte, i) in &mut self.inner[range.start as usize..range.end as usize]
+            .iter_mut()
+            .zip(range)
+        {
+            f(i, byte)?;
         }
         Ok(())
     }
@@ -104,18 +112,22 @@ impl<B: Default + BuildHasher> PointerMap for HashPointerMap<B> {
 
     fn size(&self) -> Option<u32> { None }
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, mut f: F) -> Result<(), E> {
+    fn for_each<E, F: FnMut(u32, &mut Stack) -> Result<bool, E>>(
+        &mut self,
+        range: Range<u32>,
+        mut f: F,
+    ) -> Result<(), E> {
         for i in range {
             match self.inner.entry(i) {
                 Entry::Vacant(vacant) => {
                     let mut vec = self.recycler.lease();
-                    let should_remove = f(&mut *vec)?;
+                    let should_remove = f(i, &mut *vec)?;
                     if !should_remove {
                         vacant.insert(vec.take());
                     }
                 }
                 Entry::Occupied(mut entry) => {
-                    let should_remove = f(entry.get_mut())?;
+                    let should_remove = f(i, entry.get_mut())?;
                     if should_remove {
                         self.recycler.put(entry.remove());
                     }
@@ -131,18 +143,22 @@ impl PointerMap for BTreePointerMap {
 
     fn size(&self) -> Option<u32> { None }
 
-    fn for_each<E, F: FnMut(&mut Stack) -> Result<bool, E>>(&mut self, range: Range<u32>, mut f: F) -> Result<(), E> {
+    fn for_each<E, F: FnMut(u32, &mut Stack) -> Result<bool, E>>(
+        &mut self,
+        range: Range<u32>,
+        mut f: F,
+    ) -> Result<(), E> {
         for i in range {
             match self.inner.entry(i) {
                 BEntry::Vacant(vacant) => {
                     let mut vec = self.recycler.lease();
-                    let should_remove = f(&mut *vec)?;
+                    let should_remove = f(i, &mut *vec)?;
                     if !should_remove {
                         vacant.insert(vec.take());
                     }
                 }
                 BEntry::Occupied(mut entry) => {
-                    let should_remove = f(entry.get_mut())?;
+                    let should_remove = f(i, entry.get_mut())?;
                     if should_remove {
                         self.recycler.put(entry.remove());
                     }
@@ -168,11 +184,38 @@ impl Recycle for Stack {
 }
 
 #[derive(Debug)]
-pub struct MemoryBlock<D, M = BTreePointerMap> {
+pub struct MemoryBlock<'env, D, M = BTreePointerMap> {
     memory: M,
     deallocated: FxHashSet<Pointer>,
     allocations: Slab<FxHashSet<Pointer>>,
     store: PointerStore<D>,
+    pub trackers: Vec<Tracker<'env, D>>,
+}
+
+pub struct Tracker<'env, D> {
+    pub tag: &'env str,
+    pub ptr: Pointer,
+    #[allow(clippy::type_complexity)]
+    event_handler: SyncWrapper<Box<dyn 'env + FnMut(&'env str, Pointer, RawEvent<'_, D>) + Send>>,
+}
+
+enum RawEvent<'a, D> {
+    Event(Event),
+    PoppedOff {
+        event: Event,
+        drain: &'a [u32],
+        info: &'a Slab<PointerInfo<D>>,
+    },
+    //
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Event {
+    ReborrowExlusiveInvalidated { pos: u32 },
+    ReborrowSharedInvalidated { pos: u32 },
+    ReborrowExlusive,
+    ReborrowShared,
+    //
 }
 
 struct PointerStore<D> {
@@ -181,9 +224,9 @@ struct PointerStore<D> {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PointerInfo<D> {
-    copies: u32,
+    members: FxHashSet<Pointer>,
     pub owns_allocation: bool,
     pub alloc_id: u32,
     pub range: Range<u32>,
@@ -227,6 +270,35 @@ pub enum Error {
     },
 }
 
+impl<'env, D> Tracker<'env, D> {
+    pub fn new<F: 'env + FnMut(&'env str, Pointer, Event) + Send>(
+        tag: &'env str,
+        ptr: Pointer,
+        mut event_handler: F,
+    ) -> Self {
+        Self {
+            tag,
+            ptr,
+            event_handler: SyncWrapper::new(Box::new(move |tag: &'env str, ptr, raw_event: RawEvent<'_, D>| {
+                match raw_event {
+                    RawEvent::Event(event) => event_handler(tag, ptr, event),
+                    RawEvent::PoppedOff { drain, event, info } => {
+                        for &id in drain {
+                            for &member in info[id as usize].members.iter() {
+                                if ptr == member {
+                                    event_handler(tag, ptr, event);
+                                }
+                            }
+                        }
+                    }
+                }
+            }) as _),
+        }
+    }
+
+    fn call(&mut self, event: RawEvent<'_, D>) { self.event_handler.get_mut()(self.tag, self.ptr, event) }
+}
+
 impl<D: Copy> PointerStore<D> {
     fn new() -> Self {
         Self {
@@ -244,15 +316,15 @@ impl<D: Copy> PointerStore<D> {
     fn dealloc(&mut self, ptr: Pointer) -> Result<PointerInfo<D>> {
         let id = self.counters.remove(&ptr).ok_or(Error::InvalidPtr(ptr))?;
         let info = &mut self.ptr_info[id as usize];
-        info.copies -= 1;
+        info.members.insert(ptr);
         Ok(self.ptr_info.remove(id as usize))
     }
 
     fn drop(&mut self, ptr: Pointer) -> Result<()> {
         let id = self.counters.remove(&ptr).ok_or(Error::InvalidPtr(ptr))?;
         let info = self.ptr_info.get_mut(id as usize).ok_or(Error::InvalidPtr(ptr))?;
-        info.copies -= 1;
-        if info.copies == 0 {
+        info.members.remove(&ptr);
+        if info.members.is_empty() {
             self.ptr_info.remove(id as usize);
         }
         Ok(())
@@ -262,10 +334,16 @@ impl<D: Copy> PointerStore<D> {
         let id = self.counters.get_mut(&ptr).ok_or(Error::InvalidPtr(ptr))?;
         let info = &mut self.ptr_info[*id as usize];
         let old_id = *id;
-        if info.copies != 1 {
-            info.copies -= 1;
-            let mut info = info.clone();
-            info.copies = 1;
+        if info.members.len() != 1 {
+            info.members.remove(&ptr);
+            let info = PointerInfo {
+                members: std::iter::once(ptr).collect(),
+                alloc_id: info.alloc_id,
+                meta: info.meta,
+                owns_allocation: info.owns_allocation,
+                ptr_ty: info.ptr_ty,
+                range: info.range.clone(),
+            };
             *id = u32::try_from(self.ptr_info.insert(info)).expect("Tried to create too many pointers");
         }
         Ok((old_id, *id, &mut self.ptr_info[*id as usize]))
@@ -282,21 +360,22 @@ impl<D: Copy> PointerStore<D> {
     }
 }
 
-impl<D: Metadata> Default for MemoryBlock<D> {
+impl<'env, D: Metadata> Default for MemoryBlock<'env, D> {
     fn default() -> Self { Self::new() }
 }
 
-impl<D: Metadata> MemoryBlock<D> {
+impl<'env, D: Metadata> MemoryBlock<'env, D> {
     pub fn new() -> Self { Self::with_size(0) }
 }
 
-impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
+impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
     pub fn with_size(size: u32) -> Self {
         Self {
             memory: M::with_size(size),
             store: PointerStore::new(),
             allocations: Slab::new(),
             deallocated: FxHashSet::default(),
+            trackers: Vec::new(),
         }
     }
 
@@ -311,7 +390,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             panic!("Could not allocate already tracked pointer")
         }
 
-        self.memory.for_each(range.clone(), |Stack(byte)| {
+        self.memory.for_each(range.clone(), |_, Stack(byte)| {
             if byte.is_empty() {
                 Ok(false)
             } else {
@@ -327,14 +406,14 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
         let id = self.store.alloc(ptr, PointerInfo {
             alloc_id,
-            copies: 1,
+            members: std::iter::once(ptr).collect(),
             meta: D::alloc(),
             ptr_ty: PtrType::Exclusive,
             owns_allocation: true,
             range: range.clone(),
         });
 
-        self.memory.for_each(range, |Stack(byte)| {
+        self.memory.for_each(range, |_, Stack(byte)| {
             byte.push(id);
             Ok(false)
         })
@@ -377,7 +456,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         self.allocations[alloc_id as usize].insert(ptr);
         let id = self.store.alloc(ptr, PointerInfo {
             owns_allocation: false,
-            copies: 1,
+            members: std::iter::once(ptr).collect(),
             alloc_id,
             ptr_ty,
             range,
@@ -391,7 +470,31 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let (id, source_id, source_range) =
             self.reborrow_common(ptr, source, PtrType::Exclusive, range.clone(), meta)?;
 
-        self.memory.for_each(range, |Stack(byte)| {
+        let store = &self.store;
+        let trackers = &mut self.trackers;
+
+        if !trackers.is_empty() {
+            for tracker in trackers.iter_mut() {
+                if tracker.ptr == source {
+                    tracker.call(RawEvent::Event(Event::ReborrowExlusive));
+                }
+            }
+
+            self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
+                let pos = 1 + search(source, source_id, byte, &source_range)?;
+                for tracker in trackers.iter_mut() {
+                    tracker.call(RawEvent::PoppedOff {
+                        event: Event::ReborrowExlusiveInvalidated { pos: byte_pos },
+
+                        drain: &byte[pos..],
+                        info: &store.ptr_info,
+                    });
+                }
+                Ok(false)
+            })?;
+        }
+
+        self.memory.for_each(range, |_, Stack(byte)| {
             let pos = 1 + search(source, source_id, byte, &source_range)?;
             byte.truncate(pos);
             byte.push(id);
@@ -404,7 +507,40 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let ptr_info = &self.store.ptr_info;
         let mut filter = D::filter_all();
 
-        self.memory.for_each(range, |Stack(byte)| {
+        let store = &self.store;
+        let trackers = &mut self.trackers;
+
+        if !trackers.is_empty() {
+            for tracker in trackers.iter_mut() {
+                if tracker.ptr == source {
+                    tracker.call(RawEvent::Event(Event::ReborrowShared));
+                }
+            }
+
+            self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
+                let pos = 1 + search(source, source_id, byte, &source_range).unwrap();
+
+                let offset = byte[pos..].iter().position(|&id| {
+                    let info = &ptr_info[id as usize];
+                    info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, &mut filter)
+                });
+
+                if let Some(offset) = offset {
+                    for tracker in trackers.iter_mut() {
+                        tracker.call(RawEvent::PoppedOff {
+                            event: Event::ReborrowSharedInvalidated { pos: byte_pos },
+                            drain: &byte[pos + offset..],
+                            info: &store.ptr_info,
+                        });
+                    }
+                }
+
+                byte.push(id);
+                Ok(false)
+            })?;
+        }
+
+        self.memory.for_each(range, |_, Stack(byte)| {
             let pos = 1 + search(source, source_id, byte, &source_range).unwrap();
 
             let offset = byte[pos..].iter().position(|&id| {
@@ -432,13 +568,13 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             return Err(Error::InvalidatesOldMeta(ptr))
         }
 
-        if info.copies != 1 && old_meta.does_invalidate(meta, &mut D::filter_all()) {
+        if info.members.len() != 1 && old_meta.does_invalidate(meta, &mut D::filter_all()) {
             check_range!(self, ptr, Some(info.range.clone()));
 
             let (old_id, id, info) = self.store.make_exclusive(ptr).unwrap();
             let range = info.range.clone();
 
-            self.memory.for_each(range.clone(), |Stack(byte)| {
+            self.memory.for_each(range.clone(), |_, Stack(byte)| {
                 let pos = search(ptr, old_id, byte, &range).unwrap();
                 byte.insert(pos + 1, id);
                 Ok(false)
@@ -461,7 +597,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             return Err(Error::NotShared(source))
         }
 
-        info.copies += 1;
+        info.members.insert(ptr);
         self.allocations[info.alloc_id as usize].insert(ptr);
         self.store.counters.insert(ptr, id);
 
@@ -496,7 +632,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let info = &self.store.ptr_info[id as usize];
         let range = &info.range;
 
-        self.memory.for_each(range.clone(), |Stack(byte)| {
+        self.memory.for_each(range.clone(), |_, Stack(byte)| {
             let pos = search(ptr, old_id, byte, range).unwrap();
             byte.truncate(pos);
             byte.push(id);
@@ -510,7 +646,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
 
         let (id, info) = self.store.get(ptr)?;
 
-        self.memory.for_each(info.range.clone(), |Stack(byte)| {
+        self.memory.for_each(info.range.clone(), |_, Stack(byte)| {
             search(ptr, id, byte, &info.range).unwrap();
             Ok(false)
         })?;
@@ -532,7 +668,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
         let ptr_info = &self.store.ptr_info;
         let meta = info.meta;
 
-        self.memory.for_each(info.range.clone(), |Stack(byte)| {
+        self.memory.for_each(info.range.clone(), |_, Stack(byte)| {
             let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
 
             let offset = byte[pos..].iter().position(|&id| {
@@ -558,7 +694,7 @@ impl<D: Metadata, M: PointerMap> MemoryBlock<D, M> {
             return Err(Error::NotExclusive(ptr))
         }
 
-        self.memory.for_each(info.range.clone(), |Stack(byte)| {
+        self.memory.for_each(info.range.clone(), |_, Stack(byte)| {
             let pos = search(ptr, id, byte, &info.range).unwrap();
             byte.truncate(pos + usize::from(keep));
             Ok(!keep && byte.is_empty())
@@ -592,5 +728,15 @@ impl<D: fmt::Debug> fmt::Debug for PointerStore<D> {
             });
         }
         f.finish()
+    }
+}
+
+impl<D> fmt::Debug for Tracker<'_, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tracker")
+            .field("tag", &self.tag)
+            .field("ptr", &self.ptr)
+            .field("event_handler", &"<closure>")
+            .finish()
     }
 }

@@ -34,6 +34,7 @@ impl Metadata for Permissions {
     }
 }
 
+#[allow(clippy::many_single_char_names)]
 fn main() {
     let mut memory = MemoryBlock::new();
     let a = Pointer::create();

@@ -1,28 +1,4 @@
-use crate::{Allocator, Error, InvalidKind, Invalidated};
-
-use std::ops::Range;
-
-fn span_to_string(span: &Range<usize>, line_offsets: &[usize]) -> String {
-    let line_start = match line_offsets.binary_search(&span.start) {
-        Ok(x) => x,
-        Err(x) => x - 1,
-    };
-    let line_end = match line_offsets.binary_search(&span.end) {
-        Ok(x) => x,
-        Err(x) => x - 1,
-    };
-
-    let col_start = span.start - line_offsets[line_start];
-    let col_end = span.end - line_offsets[line_end];
-
-    format!(
-        "span({}:{}..{}:{})",
-        1 + line_start,
-        1 + col_start,
-        1 + line_end,
-        1 + col_end
-    )
-}
+use crate::{Allocator, Error, InvalidKind, Invalidated, ShowSpan};
 
 struct DisplayToDebug<T>(T);
 
@@ -47,7 +23,7 @@ pub(crate) fn handle_error(
 ) -> Box<dyn std::error::Error> {
     use memory_model::alias::Error::*;
 
-    let span = span_to_string(&span, line_offsets);
+    let span = ShowSpan(&span, line_offsets);
 
     let err = match err {
         Error::Alias(err) => err,
@@ -60,7 +36,7 @@ pub(crate) fn handle_error(
                     "{}: Use of freed pointer `{ptr}`. Note: freed `{ptr}` at {freed_span}",
                     span,
                     ptr = ptr,
-                    freed_span = span_to_string(&freed_span, line_offsets)
+                    freed_span = ShowSpan(&freed_span, line_offsets)
                 ),
                 Some(Invalidated {
                     kind: InvalidKind::Moved,
@@ -69,7 +45,7 @@ pub(crate) fn handle_error(
                     "{}: Use of moved pointer `{ptr}`. Note: moved `{ptr}` at {moved_span}",
                     span,
                     ptr = ptr,
-                    moved_span = span_to_string(&moved_span, line_offsets)
+                    moved_span = ShowSpan(&moved_span, line_offsets)
                 ),
                 None => format!("{}: Unknown pointer `{}`", span, ptr),
             };
@@ -78,6 +54,9 @@ pub(crate) fn handle_error(
         }
 
         Error::NoFunction { func } => return DisplayToDebug(format!("{}: Unkown function {}", span, func)).into(),
+        Error::NoAttribute { attr } => {
+            return DisplayToDebug(format!("{}: Unkown attribute {}", span, attr.path)).into()
+        }
         Error::TypeMismatch { arg, farg } => {
             let read = ["", " read"];
             let write = ["", " write"];
@@ -86,6 +65,7 @@ pub(crate) fn handle_error(
             let arg_ty = arg.ty.unwrap();
             let farg_ty = farg.ty.unwrap();
 
+            #[allow(clippy::match_single_binding)]
             match (
                 format_args!(
                     "@{}{}{}",
@@ -107,9 +87,9 @@ pub(crate) fn handle_error(
 expected `{}`, but got `{}`",
                         span,
                         arg.name,
-                        span_to_string(&arg.span, line_offsets),
+                        ShowSpan(&arg.span, line_offsets),
                         farg.name,
-                        span_to_string(&farg.span, line_offsets),
+                        ShowSpan(&farg.span, line_offsets),
                         farg_ty,
                         arg_ty,
                     ))

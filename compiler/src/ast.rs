@@ -19,6 +19,7 @@ type Span = Range<usize>;
 #[derive(Debug, Clone)]
 pub struct Ast<'i> {
     pub span: Span,
+    pub attrs: Vec<Attribute<'i>>,
     pub kind: AstKind<'i>,
 }
 
@@ -80,6 +81,12 @@ enum Expr<'a> {
         write: bool,
         range: Option<Range<Option<u32>>>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct Attribute<'a> {
+    pub span: Span,
+    pub path: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +198,9 @@ pub fn parse<'i, 't, E: ParseError<&'t [Token<'i>]>>(
 pub fn parse_ast<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    any((
+    let (input, attrs) = range(.., parse_attr).parse_once(input)?;
+
+    let (input, mut ast) = any((
         parse_decl_var,
         parse_drop,
         parse_read,
@@ -201,13 +210,18 @@ pub fn parse_ast<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         parse_func_decl,
         //
     ))
-    .parse_once(input)
+    .parse_once(input)?;
+
+    ast.attrs = attrs;
+
+    Ok((input, ast))
 }
 
 fn parse_drop<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
     let (input, ((start, _kw_drop), (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Drop), IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
     Ok((input, Ast {
+        attrs: Vec::new(),
         span: start.start..end.end,
         kind: AstKind::Drop { name },
     }))
@@ -217,6 +231,7 @@ fn parse_read<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) ->
     let (input, ((start, _kw_read), is_exclusive, (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Read), parse_modifier, IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
     Ok((input, Ast {
+        attrs: Vec::new(),
         span: start.start..end.end,
         kind: AstKind::Read { name, is_exclusive },
     }))
@@ -226,6 +241,7 @@ fn parse_write<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -
     let (input, ((start, _kw_write), is_exclusive, (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Write), parse_modifier, IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
     Ok((input, Ast {
+        attrs: Vec::new(),
         span: start.start..end.end,
         kind: AstKind::Write { name, is_exclusive },
     }))
@@ -245,6 +261,7 @@ fn parse_update<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         ))
         .parse_once(input)?;
     Ok((input, Ast {
+        attrs: Vec::new(),
         span: start.start..end.end,
         kind: AstKind::Update {
             name,
@@ -286,6 +303,7 @@ fn parse_decl_var<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     };
 
     Ok((input, Ast {
+        attrs: Vec::new(),
         span: start.start..end.end,
         kind,
     }))
@@ -332,6 +350,7 @@ fn parse_func_call<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     .parse_once(input)?;
 
     Ok((input, Ast {
+        attrs: Vec::new(),
         span: start.start..end.end,
         kind: AstKind::FuncCall { name, args },
     }))
@@ -365,6 +384,7 @@ fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     .parse_once(input)?;
 
     Ok((input, Ast {
+        attrs: Vec::new(),
         span: start.start..end.end,
         kind: AstKind::FuncDecl { name, args, instr },
     }))
@@ -434,4 +454,20 @@ pub fn parse_range<'i, 't, E: ParseError<&'t [Token<'i>]>>(
 ) -> PResult<&'t [Token<'i>], Range<Option<u32>>, E> {
     let (input, (start, _sym_dot2, end)) = all((opt(NUM), tag(Symbol::Dot2), opt(NUM))).parse_once(input)?;
     Ok((input, start.map(|(_, start)| start)..end.map(|(_, end)| end)))
+}
+
+pub fn parse_attr<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Attribute<'i>, E> {
+    let (input, ((start, _sym_pound), _sym_open_square, (_, path), (end, _syn_close_square))) = all((
+        tag(Symbol::Pound),
+        tag(Symbol::OpenSquare),
+        IDENT,
+        tag(Symbol::CloseSquare),
+    ))
+    .parse_once(input)?;
+    Ok((input, Attribute {
+        span: start.start..end.end,
+        path,
+    }))
 }

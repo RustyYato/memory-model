@@ -28,6 +28,8 @@ pub enum Symbol {
     CloseParen,
     OpenCurly,
     CloseCurly,
+    OpenSquare,
+    CloseSquare,
     Dot2,
     SemiColon,
     Equal,
@@ -35,6 +37,7 @@ pub enum Symbol {
     Arrow,
     Colon,
     Comma,
+    Pound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,11 +170,14 @@ fn parse_token_type(mut input: &str) -> PResult<&str, (usize, TokenKind<'_>)> {
         Some(")") => Symbol::CloseParen,
         Some("{") => Symbol::OpenCurly,
         Some("}") => Symbol::CloseCurly,
+        Some("[") => Symbol::OpenSquare,
+        Some("]") => Symbol::CloseSquare,
         Some(";") => Symbol::SemiColon,
         Some(":") => Symbol::Colon,
         Some(",") => Symbol::Comma,
         Some("=") => Symbol::Equal,
         Some("@") => Symbol::Borrow,
+        Some("#") => Symbol::Pound,
         _ => return Err(Error::Error((input, ErrorKind::Custom("no token found")))),
     };
 
