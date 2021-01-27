@@ -9,6 +9,9 @@
 			"include": "#number"
 		},
 		{
+			"include": "#type"
+		},
+		{
 			"include": "#keywords"
 		},
 		{
@@ -23,11 +26,23 @@
 			"patterns": [
 				{
 					"name": "keyword.control",
-					"match": "\\b(let|shr|exc|read|write|drop|fn)\\b"
+					"match": "\\b(let|drop|fn)\\b"
+				},
+				{
+					"name": "entity.name.type",
+					"match": "\\b(shr|exc)\\b"
 				},
 				{
 					"name": "keyword.other.unit",
 					"match": "\\b(_)\\b"
+				}
+			]
+		},
+		"type": {
+			"patterns": [
+				{
+					"name": "keyword.control.less",
+					"match": "\\b(read|write)\\b"
 				}
 			]
 		},

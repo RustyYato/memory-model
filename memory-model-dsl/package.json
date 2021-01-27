@@ -24,6 +24,13 @@
             "language": "memmodeldsl",
             "scopeName": "source.mmd",
             "path": "./syntaxes/memmodeldsl.tmLanguage.json"
+        }],
+        "semanticTokenScopes": [{
+            "scopes": {
+                "extendedType": [
+                    "type"
+                ]
+            }
         }]
     }
 }
