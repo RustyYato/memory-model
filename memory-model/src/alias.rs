@@ -189,12 +189,16 @@ pub struct MemoryBlock<'env, D, M = BTreePointerMap> {
     deallocated: FxHashSet<Pointer>,
     allocations: Slab<FxHashSet<Pointer>>,
     store: PointerStore<D>,
-    pub trackers: Vec<Tracker<'env, D>>,
+    pub trackers: TrackerGroup<'env, D>,
+}
+
+#[derive(Debug)]
+pub struct TrackerGroup<'env, D> {
+    trackers: FxHashMap<Pointer, Vec<Tracker<'env, D>>>,
 }
 
 pub struct Tracker<'env, D> {
     pub tag: &'env str,
-    pub ptr: Pointer,
     #[allow(clippy::type_complexity)]
     event_handler: SyncWrapper<Box<dyn 'env + FnMut(&'env str, Pointer, RawEvent<'_, D>) + Send>>,
 }
@@ -209,7 +213,11 @@ enum RawEvent<'a, D> {
         drain: &'a [u32],
         info: &'a Slab<PointerInfo<D>>,
     },
-    //
+}
+
+impl<D> Copy for RawEvent<'_, D> {}
+impl<D> Clone for RawEvent<'_, D> {
+    fn clone(&self) -> Self { *self }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -225,7 +233,6 @@ pub enum Event {
     MarkShared,
     AssertExlusive,
     AssertShared,
-    //
 }
 
 struct PointerStore<D> {
@@ -280,22 +287,86 @@ pub enum Error {
     },
 }
 
-impl<'env, D> Tracker<'env, D> {
-    pub fn new<F: 'env + FnMut(&'env str, Pointer, Event) + Send>(
+fn vec_retain<T, F: FnMut(&mut T) -> bool>(vec: &mut Vec<T>, mut f: F) {
+    let len = vec.len();
+    let mut del = 0;
+    {
+        let v = &mut **vec;
+
+        for i in 0..len {
+            if !f(&mut v[i]) {
+                del += 1;
+            } else if del > 0 {
+                v.swap(i - del, i);
+            }
+        }
+    }
+    if del > 0 {
+        vec.truncate(len - del);
+    }
+}
+
+impl<'env, D> TrackerGroup<'env, D> {
+    pub fn register<F: 'env + FnMut(&'env str, Pointer, Event) + Send>(
+        &mut self,
         tag: &'env str,
         ptr: Pointer,
-        mut event_handler: F,
-    ) -> Self {
+        event_handler: F,
+    ) {
+        self.trackers
+            .entry(ptr)
+            .or_default()
+            .push(Tracker::new(tag, event_handler));
+    }
+
+    pub fn retain<F: FnMut(&mut Tracker<'env, D>) -> bool>(&mut self, ptr: Pointer, f: F) {
+        if let Entry::Occupied(mut trackers) = self.trackers.entry(ptr) {
+            let t = trackers.get_mut();
+            vec_retain(t, f);
+            if t.is_empty() {
+                trackers.remove();
+            }
+        }
+    }
+
+    pub fn retain_all<F: FnMut(Pointer, &mut Tracker<'env, D>) -> bool>(&mut self, mut f: F) {
+        self.trackers.retain(|&k, v| {
+            vec_retain(v, |v| f(k, v));
+            !v.is_empty()
+        })
+    }
+
+    pub fn get(&self, ptr: Pointer) -> &[Tracker<'env, D>] { self.trackers.get(&ptr).map_or(&[], Vec::as_slice) }
+
+    fn is_empty(&self) -> bool { self.trackers.is_empty() }
+
+    fn call(&mut self, event: RawEvent<'_, D>) {
+        match event {
+            RawEvent::Event { ptr, .. } => {
+                if let Some(trackers) = self.trackers.get_mut(&ptr) {
+                    for tracker in trackers {
+                        tracker.call(ptr, event)
+                    }
+                }
+            }
+            RawEvent::PoppedOff { .. } => {
+                for (&ptr, trackers) in self.trackers.iter_mut() {
+                    for tracker in trackers {
+                        tracker.call(ptr, event)
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'env, D> Tracker<'env, D> {
+    pub fn new<F: 'env + FnMut(&'env str, Pointer, Event) + Send>(tag: &'env str, mut event_handler: F) -> Self {
         Self {
             tag,
-            ptr,
             event_handler: SyncWrapper::new(Box::new(move |tag: &'env str, ptr, raw_event: RawEvent<'_, D>| {
                 match raw_event {
-                    RawEvent::Event { event, ptr: eptr } => {
-                        if eptr == ptr {
-                            event_handler(tag, ptr, event)
-                        }
-                    }
+                    RawEvent::Event { event, ptr: _ } => event_handler(tag, ptr, event),
                     RawEvent::PoppedOff { drain, event, info } => {
                         for &id in drain {
                             for &member in info[id as usize].members.iter() {
@@ -310,7 +381,7 @@ impl<'env, D> Tracker<'env, D> {
         }
     }
 
-    fn call(&mut self, event: RawEvent<'_, D>) { self.event_handler.get_mut()(self.tag, self.ptr, event) }
+    fn call(&mut self, ptr: Pointer, event: RawEvent<'_, D>) { self.event_handler.get_mut()(self.tag, ptr, event) }
 }
 
 impl<D: Copy> PointerStore<D> {
@@ -389,7 +460,9 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
             store: PointerStore::new(),
             allocations: Slab::new(),
             deallocated: FxHashSet::default(),
-            trackers: Vec::new(),
+            trackers: TrackerGroup {
+                trackers: Default::default(),
+            },
         }
     }
 
@@ -488,23 +561,19 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         let trackers = &mut self.trackers;
 
         if !trackers.is_empty() {
-            for tracker in trackers.iter_mut() {
-                tracker.call(RawEvent::Event {
-                    event: Event::ReborrowExlusive,
-                    ptr: source,
-                });
-            }
+            trackers.call(RawEvent::Event {
+                event: Event::ReborrowExlusive,
+                ptr: source,
+            });
 
             self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
                 let pos = 1 + search(source, source_id, byte, &source_range)?;
-                for tracker in trackers.iter_mut() {
-                    tracker.call(RawEvent::PoppedOff {
-                        event: Event::ReborrowExlusiveInvalidated { pos: byte_pos },
+                trackers.call(RawEvent::PoppedOff {
+                    event: Event::ReborrowExlusiveInvalidated { pos: byte_pos },
 
-                        drain: &byte[pos..],
-                        info: &store.ptr_info,
-                    });
-                }
+                    drain: &byte[pos..],
+                    info: &store.ptr_info,
+                });
                 Ok(false)
             })?;
         }
@@ -526,12 +595,10 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         let trackers = &mut self.trackers;
 
         if !trackers.is_empty() {
-            for tracker in trackers.iter_mut() {
-                tracker.call(RawEvent::Event {
-                    event: Event::ReborrowShared,
-                    ptr: source,
-                });
-            }
+            trackers.call(RawEvent::Event {
+                event: Event::ReborrowShared,
+                ptr: source,
+            });
 
             self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
                 let pos = 1 + search(source, source_id, byte, &source_range).unwrap();
@@ -542,13 +609,11 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
                 });
 
                 if let Some(offset) = offset {
-                    for tracker in trackers.iter_mut() {
-                        tracker.call(RawEvent::PoppedOff {
-                            event: Event::ReborrowSharedInvalidated { pos: byte_pos },
-                            drain: &byte[pos + offset..],
-                            info: &store.ptr_info,
-                        });
-                    }
+                    trackers.call(RawEvent::PoppedOff {
+                        event: Event::ReborrowSharedInvalidated { pos: byte_pos },
+                        drain: &byte[pos + offset..],
+                        info: &store.ptr_info,
+                    });
                 }
 
                 byte.push(id);
@@ -654,23 +719,19 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         if !trackers.is_empty() {
             let range = &info.range;
 
-            for tracker in trackers.iter_mut() {
-                tracker.call(RawEvent::Event {
-                    event: Event::MarkExlusive,
-                    ptr,
-                });
-            }
+            trackers.call(RawEvent::Event {
+                event: Event::MarkExlusive,
+                ptr,
+            });
 
             self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
                 let pos = search(ptr, old_id, byte, range).unwrap();
 
-                for tracker in trackers.iter_mut() {
-                    tracker.call(RawEvent::PoppedOff {
-                        event: Event::MarkExlusiveInvalidated { pos: byte_pos },
-                        drain: &byte[pos + 1..],
-                        info: ptr_info,
-                    })
-                }
+                trackers.call(RawEvent::PoppedOff {
+                    event: Event::MarkExlusiveInvalidated { pos: byte_pos },
+                    drain: &byte[pos + 1..],
+                    info: ptr_info,
+                });
 
                 Ok(false)
             })?;
@@ -691,12 +752,10 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         let trackers = &mut self.trackers;
 
         if !trackers.is_empty() {
-            for tracker in trackers.iter_mut() {
-                tracker.call(RawEvent::Event {
-                    event: Event::MarkShared,
-                    ptr,
-                });
-            }
+            trackers.call(RawEvent::Event {
+                event: Event::MarkShared,
+                ptr,
+            });
         }
 
         let (_, info) = self.store.get_mut(ptr).unwrap();
@@ -719,22 +778,18 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         let ptr_info = &self.store.ptr_info;
 
         if !trackers.is_empty() {
-            for tracker in trackers.iter_mut() {
-                tracker.call(RawEvent::Event {
-                    event: Event::AssertExlusive,
-                    ptr,
-                });
-            }
+            trackers.call(RawEvent::Event {
+                event: Event::AssertExlusive,
+                ptr,
+            });
 
             self.memory.for_each(info.range.clone(), |byte_pos, Stack(byte)| {
                 let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
-                for tracker in trackers.iter_mut() {
-                    tracker.call(RawEvent::PoppedOff {
-                        event: Event::AssertExlusiveInvalidated { pos: byte_pos },
-                        drain: &byte[pos..],
-                        info: ptr_info,
-                    });
-                }
+                trackers.call(RawEvent::PoppedOff {
+                    event: Event::AssertExlusiveInvalidated { pos: byte_pos },
+                    drain: &byte[pos..],
+                    info: ptr_info,
+                });
                 Ok(false)
             })?;
         }
@@ -758,12 +813,10 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         let trackers = &mut self.trackers;
 
         if !trackers.is_empty() {
-            for tracker in trackers.iter_mut() {
-                tracker.call(RawEvent::Event {
-                    event: Event::AssertShared,
-                    ptr,
-                });
-            }
+            trackers.call(RawEvent::Event {
+                event: Event::AssertShared,
+                ptr,
+            });
 
             self.memory.for_each(info.range.clone(), |byte_pos, Stack(byte)| {
                 let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
@@ -774,13 +827,11 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
                 });
 
                 if let Some(offset) = offset {
-                    for tracker in trackers.iter_mut() {
-                        tracker.call(RawEvent::PoppedOff {
-                            event: Event::AssertSharedInvalidated { pos: byte_pos },
-                            drain: &byte[pos + offset..],
-                            info: ptr_info,
-                        })
-                    }
+                    trackers.call(RawEvent::PoppedOff {
+                        event: Event::AssertSharedInvalidated { pos: byte_pos },
+                        drain: &byte[pos + offset..],
+                        info: ptr_info,
+                    })
                 }
 
                 Ok(false)
@@ -837,7 +888,6 @@ impl<D> fmt::Debug for Tracker<'_, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tracker")
             .field("tag", &self.tag)
-            .field("ptr", &self.ptr)
             .field("event_handler", &"<closure>")
             .finish()
     }

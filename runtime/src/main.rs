@@ -5,7 +5,7 @@ use std::ops::Range;
 use compiler::ast::{Arg, ArgTy, Ast, AstKind, Attribute};
 use fxhash::FxHashMap;
 use memory_model::{
-    alias::{Event, MemoryBlock, Metadata, PtrType, Tracker},
+    alias::{Event, MemoryBlock, Metadata, PtrType},
     Pointer,
 };
 
@@ -235,8 +235,6 @@ fn run<'a>(
             }
         }
 
-        let event_handler = event_handler(&ast.span, line_offsets);
-
         println!("execute {}", Span::new(&ast.span, line_offsets));
 
         match ast.kind {
@@ -256,7 +254,7 @@ fn run<'a>(
                             name,
                             ptr
                         );
-                        model.trackers.push(Tracker::new(name, ptr, event_handler.clone()))
+                        model.trackers.register(name, ptr, event_handler)
                     }
                 }
                 _ => panic!("range bounds not specified"),
@@ -306,7 +304,7 @@ fn run<'a>(
                         source_name,
                         source,
                     );
-                    model.trackers.push(Tracker::new(name, ptr, event_handler))
+                    model.trackers.register(name, ptr, event_handler);
                 }
             }
             AstKind::Update {
@@ -453,10 +451,7 @@ fn run<'a>(
     Ok(())
 }
 
-fn event_handler(span: &Range<usize>, line_offsets: &[usize]) -> impl FnMut(&str, Pointer, Event) + Clone + Send {
-    let span = Span::new(span, line_offsets);
-    move |tag: &str, ptr: Pointer, event: Event| println!("{:?}: {:?} ({})", event, ptr, tag)
-}
+fn event_handler(tag: &str, ptr: Pointer, event: Event) { println!("\t{:?}: {:?} ({})", event, ptr, tag) }
 
 struct ShowSpan<'a>(pub &'a Range<usize>, pub &'a [usize]);
 #[derive(Clone, Copy)]
