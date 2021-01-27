@@ -200,7 +200,10 @@ pub struct Tracker<'env, D> {
 }
 
 enum RawEvent<'a, D> {
-    Event(Event),
+    Event {
+        event: Event,
+        ptr: Pointer,
+    },
     PoppedOff {
         event: Event,
         drain: &'a [u32],
@@ -212,9 +215,16 @@ enum RawEvent<'a, D> {
 #[derive(Debug, Clone, Copy)]
 pub enum Event {
     ReborrowExlusiveInvalidated { pos: u32 },
+    MarkExlusiveInvalidated { pos: u32 },
     ReborrowSharedInvalidated { pos: u32 },
+    AssertExlusiveInvalidated { pos: u32 },
+    AssertSharedInvalidated { pos: u32 },
     ReborrowExlusive,
+    MarkExlusive,
     ReborrowShared,
+    MarkShared,
+    AssertExlusive,
+    AssertShared,
     //
 }
 
@@ -281,7 +291,11 @@ impl<'env, D> Tracker<'env, D> {
             ptr,
             event_handler: SyncWrapper::new(Box::new(move |tag: &'env str, ptr, raw_event: RawEvent<'_, D>| {
                 match raw_event {
-                    RawEvent::Event(event) => event_handler(tag, ptr, event),
+                    RawEvent::Event { event, ptr: eptr } => {
+                        if eptr == ptr {
+                            event_handler(tag, ptr, event)
+                        }
+                    }
                     RawEvent::PoppedOff { drain, event, info } => {
                         for &id in drain {
                             for &member in info[id as usize].members.iter() {
@@ -475,9 +489,10 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             for tracker in trackers.iter_mut() {
-                if tracker.ptr == source {
-                    tracker.call(RawEvent::Event(Event::ReborrowExlusive));
-                }
+                tracker.call(RawEvent::Event {
+                    event: Event::ReborrowExlusive,
+                    ptr: source,
+                });
             }
 
             self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
@@ -512,9 +527,10 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             for tracker in trackers.iter_mut() {
-                if tracker.ptr == source {
-                    tracker.call(RawEvent::Event(Event::ReborrowShared));
-                }
+                tracker.call(RawEvent::Event {
+                    event: Event::ReborrowShared,
+                    ptr: source,
+                });
             }
 
             self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
@@ -632,6 +648,34 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         let info = &self.store.ptr_info[id as usize];
         let range = &info.range;
 
+        let trackers = &mut self.trackers;
+        let ptr_info = &self.store.ptr_info;
+
+        if !trackers.is_empty() {
+            let range = &info.range;
+
+            for tracker in trackers.iter_mut() {
+                tracker.call(RawEvent::Event {
+                    event: Event::MarkExlusive,
+                    ptr,
+                });
+            }
+
+            self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
+                let pos = search(ptr, old_id, byte, range).unwrap();
+
+                for tracker in trackers.iter_mut() {
+                    tracker.call(RawEvent::PoppedOff {
+                        event: Event::MarkExlusiveInvalidated { pos: byte_pos },
+                        drain: &byte[pos + 1..],
+                        info: ptr_info,
+                    })
+                }
+
+                Ok(false)
+            })?;
+        }
+
         self.memory.for_each(range.clone(), |_, Stack(byte)| {
             let pos = search(ptr, old_id, byte, range).unwrap();
             byte.truncate(pos);
@@ -644,12 +688,16 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         check_dealloc!(self, ptr);
         check_range!(self, ptr);
 
-        let (id, info) = self.store.get(ptr)?;
+        let trackers = &mut self.trackers;
 
-        self.memory.for_each(info.range.clone(), |_, Stack(byte)| {
-            search(ptr, id, byte, &info.range).unwrap();
-            Ok(false)
-        })?;
+        if !trackers.is_empty() {
+            for tracker in trackers.iter_mut() {
+                tracker.call(RawEvent::Event {
+                    event: Event::MarkShared,
+                    ptr,
+                });
+            }
+        }
 
         let (_, info) = self.store.get_mut(ptr).unwrap();
         info.ptr_ty = PtrType::Shared;
@@ -657,7 +705,46 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         OK
     }
 
-    pub fn assert_exclusive(&mut self, ptr: Pointer) -> Result { self.assert_exclusive_inner(ptr, true) }
+    pub fn assert_exclusive(&mut self, ptr: Pointer) -> Result {
+        check_dealloc!(self, ptr);
+        check_range!(self, ptr);
+
+        let (id, info) = self.store.get(ptr)?;
+
+        if info.ptr_ty != PtrType::Exclusive {
+            return Err(Error::NotExclusive(ptr))
+        }
+
+        let trackers = &mut self.trackers;
+        let ptr_info = &self.store.ptr_info;
+
+        if !trackers.is_empty() {
+            for tracker in trackers.iter_mut() {
+                tracker.call(RawEvent::Event {
+                    event: Event::AssertExlusive,
+                    ptr,
+                });
+            }
+
+            self.memory.for_each(info.range.clone(), |byte_pos, Stack(byte)| {
+                let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
+                for tracker in trackers.iter_mut() {
+                    tracker.call(RawEvent::PoppedOff {
+                        event: Event::AssertExlusiveInvalidated { pos: byte_pos },
+                        drain: &byte[pos..],
+                        info: ptr_info,
+                    });
+                }
+                Ok(false)
+            })?;
+        }
+
+        self.memory.for_each(info.range.clone(), |_, Stack(byte)| {
+            let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
+            byte.truncate(pos);
+            Ok(false)
+        })
+    }
 
     pub fn assert_shared(&mut self, ptr: Pointer, mut filter: D::Filter) -> Result {
         check_dealloc!(self, ptr);
@@ -667,6 +754,38 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
         let (id, info) = self.store.get(ptr)?;
         let ptr_info = &self.store.ptr_info;
         let meta = info.meta;
+
+        let trackers = &mut self.trackers;
+
+        if !trackers.is_empty() {
+            for tracker in trackers.iter_mut() {
+                tracker.call(RawEvent::Event {
+                    event: Event::AssertShared,
+                    ptr,
+                });
+            }
+
+            self.memory.for_each(info.range.clone(), |byte_pos, Stack(byte)| {
+                let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
+
+                let offset = byte[pos..].iter().position(|&id| {
+                    let info = &ptr_info[id as usize];
+                    info.ptr_ty == PtrType::Exclusive || meta.does_invalidate(info.meta, filter)
+                });
+
+                if let Some(offset) = offset {
+                    for tracker in trackers.iter_mut() {
+                        tracker.call(RawEvent::PoppedOff {
+                            event: Event::AssertSharedInvalidated { pos: byte_pos },
+                            drain: &byte[pos + offset..],
+                            info: ptr_info,
+                        })
+                    }
+                }
+
+                Ok(false)
+            })?;
+        }
 
         self.memory.for_each(info.range.clone(), |_, Stack(byte)| {
             let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
@@ -681,23 +800,6 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
             }
 
             Ok(false)
-        })
-    }
-
-    fn assert_exclusive_inner(&mut self, ptr: Pointer, keep: bool) -> Result {
-        check_dealloc!(self, ptr);
-        check_range!(self, ptr);
-
-        let (id, info) = self.store.get(ptr)?;
-
-        if info.ptr_ty != PtrType::Exclusive {
-            return Err(Error::NotExclusive(ptr))
-        }
-
-        self.memory.for_each(info.range.clone(), |_, Stack(byte)| {
-            let pos = search(ptr, id, byte, &info.range).unwrap();
-            byte.truncate(pos + usize::from(keep));
-            Ok(!keep && byte.is_empty())
         })
     }
 }
