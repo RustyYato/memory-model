@@ -45,6 +45,8 @@ struct Function<'a> {
     args: Vec<Arg<'a>>,
     map: FunctionMap<'a>,
     instrs: Vec<Ast<'a>>,
+    ret_value: Option<Vec<(Range<usize>, &'a str)>>,
+    ret_ty: Option<Vec<Option<ArgTy>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,7 +156,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut model = State::with_size(0);
     let mut allocator = Allocator::default();
-    let map = build_function_map(&mut instrs);
+
+    let map = match build_function_map(&mut instrs) {
+        Ok(x) => x,
+        Err((span, e)) => return Err(error::handle_error(e, span, &allocator, &line_offsets)),
+    };
+
     let map = FunctionMapRef {
         inner: &map,
         parent: None,
@@ -163,13 +170,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run(&instrs, &line_offsets, map, &mut model, &mut allocator)
 }
 
-fn build_function_map<'a>(instrs: &mut Vec<Ast<'a>>) -> FunctionMap<'a> {
+fn build_function_map<'a>(instrs: &mut Vec<Ast<'a>>) -> Result<FunctionMap<'a>, (Range<usize>, Error<'a>)> {
     let mut map = FunctionMap::default();
     let drain = instrs.drain_filter(|ast| matches!(ast.kind, AstKind::FuncDecl { .. }));
 
     for func_decl in drain {
-        let (name, args, mut instrs) = match func_decl.kind {
-            AstKind::FuncDecl { name, args, instr } => (name, args, instr),
+        let (name, args, mut instrs, ret_value, ret_ty) = match func_decl.kind {
+            AstKind::FuncDecl {
+                name,
+                args,
+                instr,
+                ret_value,
+                ret_ty,
+            } => (name, args, instr, ret_value, ret_ty),
             _ => unreachable!(),
         };
 
@@ -177,15 +190,17 @@ fn build_function_map<'a>(instrs: &mut Vec<Ast<'a>>) -> FunctionMap<'a> {
             Entry::Vacant(entry) => {
                 entry.insert(Function {
                     args,
-                    map: build_function_map(&mut instrs),
+                    map: build_function_map(&mut instrs)?,
                     instrs,
+                    ret_value,
+                    ret_ty,
                 });
             }
             Entry::Occupied(_) => panic!("function {} was declared twice!", name),
         }
     }
 
-    map
+    Ok(map)
 }
 
 fn run<'a>(
@@ -403,6 +418,7 @@ fn run<'a>(
                                 name: arg,
                                 span: span.clone(),
                                 ty: Some(ArgTy {
+                                    span: span.clone(),
                                     is_exclusive,
                                     read: info.meta.read,
                                     write: info.meta.write,

@@ -62,6 +62,8 @@ pub enum AstKind<'i> {
         name: &'i str,
         args: Vec<Arg<'i>>,
         instr: Vec<Ast<'i>>,
+        ret_value: Option<Vec<(Span, &'i str)>>,
+        ret_ty: Option<Vec<Option<ArgTy>>>,
     },
     FuncCall {
         name: &'i str,
@@ -96,14 +98,16 @@ pub struct Arg<'a> {
     pub ty: Option<ArgTy>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ArgTy {
+    pub span: Span,
     pub is_exclusive: bool,
     pub read: bool,
     pub write: bool,
 }
 
 struct Perm {
+    span: Option<Span>,
     read: bool,
     write: bool,
 }
@@ -142,6 +146,20 @@ impl<'t, 'i> Tag<&'t [Token<'i>]> for TagNum {
                 kind: TokenKind::Number(num),
                 ref span,
             }, ref input @ ..] => Ok((input, (span.clone(), num))),
+            _ => Err(Error::Error(CaptureInput(input))),
+        }
+    }
+}
+
+impl<'t, 'i> Tag<&'t [Token<'i>]> for TokenKind<'i> {
+    type Output = (Span, Self);
+
+    fn parse_tag(
+        &self,
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Self::Output, CaptureInput<&'t [Token<'i>]>, core::convert::Infallible> {
+        match *input {
+            [Token { kind, ref span }, ref input @ ..] if *self == kind => Ok((input, (span.clone(), kind))),
             _ => Err(Error::Error(CaptureInput(input))),
         }
     }
@@ -228,7 +246,7 @@ fn parse_drop<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) ->
 }
 
 fn parse_read<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, ((start, _kw_read), is_exclusive, (_, name), (end, _sym_semi))) =
+    let (input, ((start, _kw_read), (_, is_exclusive), (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Read), parse_modifier, IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
     Ok((input, Ast {
         attrs: Vec::new(),
@@ -238,7 +256,7 @@ fn parse_read<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) ->
 }
 
 fn parse_write<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, ((start, _kw_write), is_exclusive, (_, name), (end, _sym_semi))) =
+    let (input, ((start, _kw_write), (_, is_exclusive), (_, name), (end, _sym_semi))) =
         all((tag(Keyword::Write), parse_modifier, IDENT, tag(Symbol::SemiColon))).parse_once(input)?;
     Ok((input, Ast {
         attrs: Vec::new(),
@@ -250,16 +268,18 @@ fn parse_write<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -
 fn parse_update<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, ((start, name), _sym_arrow, _sym_borrow, is_exclusive, Perm { read, write }, (end, _sym_semi))) =
-        all((
-            IDENT,
-            tag(Symbol::Arrow),
-            tag(Symbol::Borrow),
-            parse_modifier,
-            parse_permissions,
-            tag(Symbol::SemiColon),
-        ))
-        .parse_once(input)?;
+    let (
+        input,
+        ((start, name), _sym_arrow, _sym_borrow, (_, is_exclusive), Perm { span: _, read, write }, (end, _sym_semi)),
+    ) = all((
+        IDENT,
+        tag(Symbol::Arrow),
+        tag(Symbol::Borrow),
+        parse_modifier,
+        parse_permissions,
+        tag(Symbol::SemiColon),
+    ))
+    .parse_once(input)?;
     Ok((input, Ast {
         attrs: Vec::new(),
         span: start.start..end.end,
@@ -317,14 +337,14 @@ fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) ->
                 map(IDENT, |(_, name)| name),
                 opt(all((
                     tag(Symbol::Borrow),
-                    parse_modifier,
+                    map(parse_modifier, |(_, is_exclusive)| is_exclusive),
                     parse_permissions,
                     opt(parse_range),
                 ))),
             )),
             |(source, rest)| match rest {
                 None => Expr::Move { source },
-                Some((_sym_borrow, is_exclusive, Perm { read, write }, range)) => Expr::Borrow {
+                Some((_sym_borrow, is_exclusive, Perm { span: _, read, write }, range)) => Expr::Borrow {
                     source,
                     is_exclusive,
                     read,
@@ -361,24 +381,18 @@ fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
 ) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
     let (
         input,
-        (
-            (start, _kw_fn),
-            (_, name),
-            _sym_open_paren,
-            args,
-            _sym_close_paren,
-            _sym_open_curly,
-            instr,
-            (end, _sym_close_curly),
-        ),
+        ((start, _kw_fn), (_, name), args, ret_ty, _sym_open_curly, (instr, ret_value), (end, _sym_close_curly)),
     ) = all((
         tag(Keyword::Fn),
         IDENT,
-        tag(Symbol::OpenParen),
-        separated(.., tag(Symbol::Comma), parse_arg),
-        tag(Symbol::CloseParen),
+        dec::seq::mid(
+            tag(Symbol::OpenParen),
+            separated(.., tag(Symbol::Comma), parse_arg),
+            tag(Symbol::CloseParen),
+        ),
+        opt(parse_ret_ty),
         tag(Symbol::OpenCurly),
-        range(.., parse_ast),
+        all((range(.., parse_ast), opt(parse_ret_value))),
         tag(Symbol::CloseCurly),
     ))
     .parse_once(input)?;
@@ -386,66 +400,122 @@ fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     Ok((input, Ast {
         attrs: Vec::new(),
         span: start.start..end.end,
-        kind: AstKind::FuncDecl { name, args, instr },
+        kind: AstKind::FuncDecl {
+            name,
+            args,
+            instr,
+            ret_value,
+            ret_ty,
+        },
     }))
 }
 
 fn parse_arg<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Arg<'i>, E> {
-    let (input, (span, name)) = IDENT.parse_once(input)?;
-    let (input, type_annotation) = opt(all((
-        tag(Symbol::Colon),
-        tag(Symbol::Borrow),
-        parse_modifier,
-        parse_permissions,
-    )))
-    .parse_once(input)?;
+    let (input, ((span, name), ty)) =
+        all((IDENT, opt(dec::seq::snd(tag(Symbol::Colon), parse_arg_ty)))).parse_once(input)?;
 
-    if let Some((_sym_colon, _sym_borrow, is_exclusive, Perm { read, write })) = type_annotation {
-        Ok((input, Arg {
-            span,
-            name,
-            ty: Some(ArgTy {
-                is_exclusive,
-                read,
-                write,
-            }),
-        }))
-    } else {
-        Ok((input, Arg { span, name, ty: None }))
-    }
+    Ok((input, Arg { span, name, ty }))
 }
 
-fn parse_modifier<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], bool, E> {
-    any((value(false, tag(Keyword::Shared)), value(true, tag(Keyword::Exclusive)))).parse_once(input)
+fn parse_arg_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], ArgTy, E> {
+    let (input, ((start, _sym_borrow), (span, is_exclusive), Perm { span: end, read, write })) =
+        all((tag(Symbol::Borrow), parse_modifier, parse_permissions)).parse_once(input)?;
+
+    let end = end.unwrap_or(span);
+
+    Ok((input, ArgTy {
+        span: start.start..end.end,
+        is_exclusive,
+        read,
+        write,
+    }))
+}
+
+fn parse_ret_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Vec<Option<ArgTy>>, E> {
+    dec::seq::snd(
+        tag(Symbol::Arrow),
+        dec::seq::mid(
+            tag(Symbol::OpenParen),
+            dec::seq::fst(
+                separated(
+                    ..,
+                    tag(Symbol::Comma),
+                    any((map(parse_arg_ty, Some), value(None, tag(TokenKind::Ident("_"))))),
+                ),
+                opt(tag(Symbol::Comma)),
+            ),
+            tag(Symbol::CloseParen),
+        ),
+    )
+    .parse_once(input)
+}
+
+fn parse_ret_value<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Vec<(Span, &'i str)>, E> {
+    dec::seq::mid(
+        tag(Symbol::OpenParen),
+        dec::seq::fst(separated(.., tag(Symbol::Comma), IDENT), opt(tag(Symbol::Comma))),
+        tag(Symbol::CloseParen),
+    )
+    .parse_once(input)
+}
+
+fn parse_modifier<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], (Span, bool), E> {
+    match any((tag(Keyword::Shared), tag(Keyword::Exclusive))).parse_once(input)? {
+        (input, (span, Keyword::Shared)) => Ok((input, (span, false))),
+        (input, (span, Keyword::Exclusive)) => Ok((input, (span, true))),
+        _ => unreachable!(),
+    }
 }
 
 fn parse_permissions<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Perm, E> {
-    let (input, is_write) = opt(any((
-        value(false, tag(Keyword::Read)),
-        value(true, tag(Keyword::Write)),
-    )))
-    .parse_once(input)?;
+    let (input, is_write) = opt(any((tag(Keyword::Read), tag(Keyword::Write)))).parse_once(input)?;
     match is_write {
         None => Ok((input, Perm {
+            span: None,
             read: false,
             write: false,
         })),
-        Some(true) => {
+        Some((start, Keyword::Write)) => {
             let (input, read) = opt(tag(Keyword::Read)).parse_once(input)?;
-            Ok((input, Perm {
-                read: read.is_some(),
-                write: true,
-            }))
+            if let Some((end, _kw_read)) = read {
+                Ok((input, Perm {
+                    span: Some(start.start..end.end),
+                    read: true,
+                    write: true,
+                }))
+            } else {
+                Ok((input, Perm {
+                    span: Some(start),
+                    read: false,
+                    write: true,
+                }))
+            }
         }
-        Some(false) => {
+        Some((start, Keyword::Read)) => {
             let (input, write) = opt(tag(Keyword::Write)).parse_once(input)?;
-            Ok((input, Perm {
-                read: true,
-                write: write.is_some(),
-            }))
+            if let Some((end, _kw_write)) = write {
+                Ok((input, Perm {
+                    span: Some(start.start..end.end),
+                    read: true,
+                    write: true,
+                }))
+            } else {
+                Ok((input, Perm {
+                    span: Some(start),
+                    read: true,
+                    write: false,
+                }))
+            }
         }
+        _ => unreachable!(),
     }
 }
 
