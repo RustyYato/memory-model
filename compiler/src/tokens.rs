@@ -49,6 +49,8 @@ pub enum Keyword {
     Write,
     Drop,
     Fn,
+    New,
+    Ignore,
 }
 
 pub fn parse<'a, E: ParseError<Input<'a>>>(input: Input<'a>) -> PResult<Input<'a>, Vec<Token<'_>>, E> {
@@ -150,6 +152,8 @@ fn parse_token_type(mut input: &str) -> PResult<&str, (usize, TokenKind<'_>)> {
                 "write" => Keyword::Write,
                 "drop" => Keyword::Drop,
                 "fn" => Keyword::Fn,
+                "new" => Keyword::New,
+                "_" => Keyword::Ignore,
                 _ => return Ok((input, (offset, TokenKind::Ident(ident)))),
             };
 

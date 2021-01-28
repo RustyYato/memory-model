@@ -3,11 +3,10 @@ use std::ops::Range;
 use dec::{
     base::{
         error::{CaptureInput, Error, PResult, ParseError},
-        ParseOnce, Tag,
+        ParseMut, ParseOnce, Tag,
     },
     branch::any,
     combinator::opt,
-    map::{map, value},
     seq::{all, range, separated},
     tag::tag,
 };
@@ -25,13 +24,9 @@ pub struct Ast<'i> {
 
 #[derive(Debug, Clone)]
 pub enum AstKind<'i> {
-    Allocate {
-        name: &'i str,
-        range: Range<Option<u32>>,
-    },
-    Move {
-        name: &'i str,
-        source: &'i str,
+    Let {
+        pat: Pattern<'i>,
+        expr: Expr<'i>,
     },
     Read {
         name: &'i str,
@@ -47,14 +42,6 @@ pub enum AstKind<'i> {
         read: bool,
         write: bool,
     },
-    Borrow {
-        name: &'i str,
-        source: &'i str,
-        is_exclusive: bool,
-        read: bool,
-        write: bool,
-        range: Option<Range<Option<u32>>>,
-    },
     Drop {
         name: &'i str,
     },
@@ -62,8 +49,8 @@ pub enum AstKind<'i> {
         name: &'i str,
         args: Vec<Arg<'i>>,
         instr: Vec<Ast<'i>>,
-        ret_value: Option<Vec<(Span, &'i str)>>,
-        ret_ty: Option<Vec<Option<ArgTy>>>,
+        ret_value: Option<Expr<'i>>,
+        ret_ty: Option<Type>,
     },
     FuncCall {
         name: &'i str,
@@ -71,18 +58,62 @@ pub enum AstKind<'i> {
     },
 }
 
-enum Expr<'a> {
-    Range(Range<Option<u32>>),
+#[derive(Debug, Clone)]
+pub enum Pattern<'a> {
+    Ignore { span: Span },
+    Name { name: &'a str, span: Span },
+    Splat { name: &'a str, span: Span },
+    Tuple { pats: Vec<Pattern<'a>>, span: Span },
+}
+
+#[derive(Debug, Clone)]
+pub enum Expr<'a> {
+    Alloc {
+        range: Range<Option<u32>>,
+        span: Span,
+    },
+    Tuple {
+        exprs: Vec<Expr<'a>>,
+        span: Span,
+    },
+    Splat {
+        source: &'a str,
+        span: Span,
+    },
     Move {
         source: &'a str,
+        span: Span,
     },
     Borrow {
         source: &'a str,
+        span: Span,
         is_exclusive: bool,
         read: bool,
         write: bool,
         range: Option<Range<Option<u32>>>,
     },
+}
+
+impl Pattern<'_> {
+    pub fn span(&self) -> Span {
+        use Pattern::*;
+        match self {
+            Ignore { span } | Tuple { span, .. } | Splat { span, .. } | Name { span, .. } => span.clone(),
+        }
+    }
+}
+
+impl Expr<'_> {
+    pub fn span(&self) -> Span {
+        use Expr::*;
+        match self {
+            | Alloc { span, .. }
+            | Tuple { span, .. }
+            | Splat { span, .. }
+            | Move { span, .. }
+            | Borrow { span, .. } => span.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,15 +126,24 @@ pub struct Attribute<'a> {
 pub struct Arg<'a> {
     pub span: Range<usize>,
     pub name: &'a str,
-    pub ty: Option<ArgTy>,
+    pub ty: Type,
 }
 
 #[derive(Debug, Clone)]
-pub struct ArgTy {
-    pub span: Span,
-    pub is_exclusive: bool,
-    pub read: bool,
-    pub write: bool,
+pub enum Type {
+    Dynamic {
+        span: Option<Span>,
+    },
+    Borrow {
+        span: Span,
+        is_exclusive: bool,
+        read: bool,
+        write: bool,
+    },
+    Tuple {
+        span: Span,
+        types: Vec<Type>,
+    },
 }
 
 struct Perm {
@@ -295,66 +335,158 @@ fn parse_update<'i, 't, E: ParseError<&'t [Token<'i>]>>(
 fn parse_decl_var<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, ((start, _kw_let), (_, name), _sym_eq, expr, (end, _sym_semi))) = all((
+    let (input, ((start, _kw_let), pat, _sym_eq, expr, (end, _sym_semi))) = all((
         tag(Keyword::Let),
-        IDENT,
+        parse_pattern,
         tag(Symbol::Equal),
         parse_expr,
         tag(Symbol::SemiColon),
     ))
     .parse_once(input)?;
-    let kind = match expr {
-        Expr::Range(range) => AstKind::Allocate { name, range },
-        Expr::Move { source } => AstKind::Move { name, source },
-        Expr::Borrow {
-            source,
-            is_exclusive,
-            read,
-            write,
-            range,
-        } => AstKind::Borrow {
-            name,
-            source,
-            is_exclusive,
-            read,
-            write,
-            range,
-        },
-    };
 
     Ok((input, Ast {
         attrs: Vec::new(),
         span: start.start..end.end,
-        kind,
+        kind: AstKind::Let { pat, expr },
     }))
 }
 
+#[allow(clippy::type_complexity)]
+fn parse_generic_tuple<'i: 't, 't, E: ParseError<&'t [Token<'i>]>, P: ParseMut<&'t [Token<'i>], E>>(
+    input: &'t [Token<'i>],
+    parser: P,
+) -> PResult<&'t [Token<'i>], (Span, Vec<P::Output>), E> {
+    let (input, ((start, _sym_open_paren), items, (end, _sym_close_paren))) = all((
+        tag(Symbol::OpenParen),
+        dec::seq::fst(
+            dec::seq::separated(.., tag(Symbol::Comma), parser),
+            opt(tag(Symbol::Comma)),
+        ),
+        tag(Symbol::CloseParen),
+    ))
+    .parse_once(input)?;
+
+    Ok((input, (start.start..end.end, items)))
+}
+
+fn parse_pattern<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Pattern<'i>, E> {
+    fn parse_tuple<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Pattern<'i>, E> {
+        let (input, (span, pats)) = parse_generic_tuple(input, parse_pattern)?;
+        Ok((input, Pattern::Tuple { pats, span }))
+    }
+
+    fn parse_splat<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Pattern<'i>, E> {
+        let (input, ((start, _sym_dot2), (end, name))) = all((tag(Symbol::Dot2), IDENT)).parse_once(input)?;
+
+        Ok((input, Pattern::Splat {
+            name,
+            span: start.start..end.end,
+        }))
+    }
+
+    fn parse_name<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Pattern<'i>, E> {
+        let (input, (span, name)) = IDENT.parse_once(input)?;
+
+        Ok((input, Pattern::Name { name, span }))
+    }
+
+    fn parse_ignore<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Pattern<'i>, E> {
+        let (input, (span, _kw_ignore)) = tag(Keyword::Ignore).parse_once(input)?;
+
+        Ok((input, Pattern::Ignore { span }))
+    }
+
+    any((parse_name, parse_ignore, parse_tuple, parse_splat)).parse_once(input)
+}
+
 fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
-    any((
-        map(parse_range, Expr::Range),
-        map(
-            all((
-                map(IDENT, |(_, name)| name),
-                opt(all((
-                    tag(Symbol::Borrow),
-                    map(parse_modifier, |(_, is_exclusive)| is_exclusive),
-                    parse_permissions,
-                    opt(parse_range),
-                ))),
-            )),
-            |(source, rest)| match rest {
-                None => Expr::Move { source },
-                Some((_sym_borrow, is_exclusive, Perm { span: _, read, write }, range)) => Expr::Borrow {
+    fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
+        let (input, ((span, source), rest)) = all((
+            IDENT,
+            opt(all((
+                tag(Symbol::Borrow),
+                parse_modifier,
+                parse_permissions,
+                opt(parse_range),
+            ))),
+        ))
+        .parse_once(input)?;
+
+        let expr = match rest {
+            None => Expr::Move { source, span },
+            Some((
+                _sym_borrow,
+                (exc_span, is_exclusive),
+                Perm {
+                    span: perm_span,
+                    read,
+                    write,
+                },
+                range,
+            )) => {
+                let (end, range) = match range {
+                    Some((end, range)) => (end, Some(range)),
+                    None => (perm_span.unwrap_or(exc_span), None),
+                };
+
+                let span = span.start..end.end;
+
+                Expr::Borrow {
                     source,
+                    span,
                     is_exclusive,
                     read,
                     write,
                     range,
-                },
-            },
-        ),
-    ))
-    .parse_once(input)
+                }
+            }
+        };
+
+        Ok((input, expr))
+    }
+
+    fn parse_tuple<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
+        let (input, (span, exprs)) = parse_generic_tuple(input, parse_expr)?;
+        Ok((input, Expr::Tuple { exprs, span }))
+    }
+
+    fn parse_splat<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
+        let (input, ((start, _sym_dot2), (end, source))) = all((tag(Symbol::Dot2), IDENT)).parse_once(input)?;
+
+        Ok((input, Expr::Splat {
+            source,
+            span: start.start..end.end,
+        }))
+    }
+
+    fn parse_new<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
+        let (input, ((start, _kw_new), (end, range))) = all((tag(Keyword::New), parse_range)).parse_once(input)?;
+
+        Ok((input, Expr::Alloc {
+            span: start.start..end.end,
+            range,
+        }))
+    }
+
+    any((parse_borrow, parse_tuple, parse_new, parse_splat)).parse_once(input)
 }
 
 fn parse_func_call<'i, 't, E: ParseError<&'t [Token<'i>]>>(
@@ -390,9 +522,9 @@ fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
             separated(.., tag(Symbol::Comma), parse_arg),
             tag(Symbol::CloseParen),
         ),
-        opt(parse_ret_ty),
+        opt(parse_ty),
         tag(Symbol::OpenCurly),
-        all((range(.., parse_ast), opt(parse_ret_value))),
+        all((range(.., parse_ast), opt(parse_expr))),
         tag(Symbol::CloseCurly),
     ))
     .parse_once(input)?;
@@ -412,55 +544,47 @@ fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
 
 fn parse_arg<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Arg<'i>, E> {
     let (input, ((span, name), ty)) =
-        all((IDENT, opt(dec::seq::snd(tag(Symbol::Colon), parse_arg_ty)))).parse_once(input)?;
+        all((IDENT, opt(dec::seq::snd(tag(Symbol::Colon), parse_ty)))).parse_once(input)?;
 
-    Ok((input, Arg { span, name, ty }))
-}
-
-fn parse_arg_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], ArgTy, E> {
-    let (input, ((start, _sym_borrow), (span, is_exclusive), Perm { span: end, read, write })) =
-        all((tag(Symbol::Borrow), parse_modifier, parse_permissions)).parse_once(input)?;
-
-    let end = end.unwrap_or(span);
-
-    Ok((input, ArgTy {
-        span: start.start..end.end,
-        is_exclusive,
-        read,
-        write,
+    Ok((input, Arg {
+        span,
+        name,
+        ty: ty.unwrap_or(Type::Dynamic { span: None }),
     }))
 }
 
-fn parse_ret_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(
-    input: &'t [Token<'i>],
-) -> PResult<&'t [Token<'i>], Vec<Option<ArgTy>>, E> {
-    dec::seq::snd(
-        tag(Symbol::Arrow),
-        dec::seq::mid(
-            tag(Symbol::OpenParen),
-            dec::seq::fst(
-                separated(
-                    ..,
-                    tag(Symbol::Comma),
-                    any((map(parse_arg_ty, Some), value(None, tag(TokenKind::Ident("_"))))),
-                ),
-                opt(tag(Symbol::Comma)),
-            ),
-            tag(Symbol::CloseParen),
-        ),
-    )
-    .parse_once(input)
-}
+fn parse_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Type, E> {
+    fn parse_dynamic<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Type, E> {
+        let (input, (span, _kw_ignore)) = tag(Keyword::Ignore).parse_once(input)?;
+        Ok((input, Type::Dynamic { span: Some(span) }))
+    }
 
-fn parse_ret_value<'i, 't, E: ParseError<&'t [Token<'i>]>>(
-    input: &'t [Token<'i>],
-) -> PResult<&'t [Token<'i>], Vec<(Span, &'i str)>, E> {
-    dec::seq::mid(
-        tag(Symbol::OpenParen),
-        dec::seq::fst(separated(.., tag(Symbol::Comma), IDENT), opt(tag(Symbol::Comma))),
-        tag(Symbol::CloseParen),
-    )
-    .parse_once(input)
+    fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Type, E> {
+        let (input, ((start, _sym_borrow), (span, is_exclusive), Perm { span: end, read, write })) =
+            all((tag(Symbol::Borrow), parse_modifier, parse_permissions)).parse_once(input)?;
+
+        let end = end.unwrap_or(span);
+
+        Ok((input, Type::Borrow {
+            span: start.start..end.end,
+            is_exclusive,
+            read,
+            write,
+        }))
+    }
+
+    fn parse_tuple<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+        input: &'t [Token<'i>],
+    ) -> PResult<&'t [Token<'i>], Type, E> {
+        let (input, (span, types)) = parse_generic_tuple(input, parse_ty)?;
+        Ok((input, Type::Tuple { types, span }))
+    }
+
+    any((parse_dynamic, parse_borrow, parse_tuple)).parse_once(input)
 }
 
 fn parse_modifier<'i, 't, E: ParseError<&'t [Token<'i>]>>(
@@ -519,11 +643,17 @@ fn parse_permissions<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn parse_range<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
-) -> PResult<&'t [Token<'i>], Range<Option<u32>>, E> {
-    let (input, (start, _sym_dot2, end)) = all((opt(NUM), tag(Symbol::Dot2), opt(NUM))).parse_once(input)?;
-    Ok((input, start.map(|(_, start)| start)..end.map(|(_, end)| end)))
+) -> PResult<&'t [Token<'i>], (Span, Range<Option<u32>>), E> {
+    let (input, (start, (span, _sym_dot2), end)) = all((opt(NUM), tag(Symbol::Dot2), opt(NUM))).parse_once(input)?;
+    match (start, end) {
+        (Some((start, s)), Some((end, e))) => Ok((input, (start.start..end.end, Some(s)..Some(e)))),
+        (None, Some((end, e))) => Ok((input, (span.start..end.end, None..Some(e)))),
+        (Some((start, s)), None) => Ok((input, (start.start..span.end, Some(s)..None))),
+        (None, None) => Ok((input, (span, None..None))),
+    }
 }
 
 pub fn parse_attr<'i, 't, E: ParseError<&'t [Token<'i>]>>(
