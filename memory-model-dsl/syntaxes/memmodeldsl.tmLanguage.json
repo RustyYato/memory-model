@@ -26,7 +26,7 @@
 			"patterns": [
 				{
 					"name": "keyword.control",
-					"match": "\\b(let|drop|fn)\\b"
+					"match": "\\b(let|new|drop|fn)\\b"
 				},
 				{
 					"name": "entity.name.type",

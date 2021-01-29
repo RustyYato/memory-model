@@ -1,4 +1,4 @@
-use crate::{Allocator, Error, InvalidKind, Invalidated, ShowSpan};
+use crate::{Allocator, DispSpan, Error, InvalidKind, Invalidated, ShowSpan};
 
 struct DisplayToDebug<T>(T);
 
@@ -27,6 +27,20 @@ pub(crate) fn handle_error(
 
     let err = match err {
         Error::Alias(err) => err,
+        Error::AllocNoBind { span } => {
+            return DisplayToDebug(format!(
+                "{}: Allocations must be bound",
+                DispSpan::new(&span, line_offsets)
+            ))
+            .into()
+        }
+        Error::AllocRangeBoundsNotSpecied { span } => {
+            return DisplayToDebug(format!(
+                "{}: Both allocations range bounds must be specified",
+                DispSpan::new(&span, line_offsets)
+            ))
+            .into()
+        }
         Error::InvalidPtr(ptr) => {
             let err = match allocator.invalidated.get(ptr) {
                 Some(Invalidated {
@@ -55,47 +69,26 @@ pub(crate) fn handle_error(
 
         Error::NoFunction { func } => return DisplayToDebug(format!("{}: Unkown function {}", span, func)).into(),
         Error::NoAttribute { attr } => {
-            return DisplayToDebug(format!("{}: Unkown attribute {}", span, attr.path)).into()
+            return DisplayToDebug(format!("{}: Unkown attribute {}", span, attr.path.name)).into()
         }
         Error::TypeMismatch { arg, farg } => {
             let read = ["", " read"];
             let write = ["", " write"];
             let modifier = ["shr", "exc"];
 
-            let arg_ty = arg.ty.unwrap();
-            let farg_ty = farg.ty.unwrap();
-
-            #[allow(clippy::match_single_binding)]
-            match (
-                format_args!(
-                    "@{}{}{}",
-                    modifier[usize::from(arg_ty.is_exclusive)],
-                    read[usize::from(arg_ty.read)],
-                    write[usize::from(arg_ty.write)]
-                ),
-                format_args!(
-                    "@{}{}{}",
-                    modifier[usize::from(farg_ty.is_exclusive)],
-                    read[usize::from(farg_ty.read)],
-                    write[usize::from(farg_ty.write)]
-                ),
-            ) {
-                (arg_ty, farg_ty) => {
-                    return DisplayToDebug(format!(
-                        "\
+            return DisplayToDebug(format!(
+                "\
 {}: Type mismatch: argument `{}` (at {}) didn't match declared argument `{}` (at {}):
-expected `{}`, but got `{}`",
-                        span,
-                        arg.name,
-                        ShowSpan(&arg.span, line_offsets),
-                        farg.name,
-                        ShowSpan(&farg.span, line_offsets),
-                        farg_ty,
-                        arg_ty,
-                    ))
-                    .into()
-                }
-            }
+expected `{:?}`, but got `{:?}`",
+                span,
+                arg.id.name,
+                ShowSpan(&arg.id.span, line_offsets),
+                farg.id.name,
+                ShowSpan(&farg.id.span, line_offsets),
+                &farg.ty,
+                &arg.ty,
+            ))
+            .into()
         }
     };
 
