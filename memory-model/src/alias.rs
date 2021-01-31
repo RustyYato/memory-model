@@ -223,19 +223,27 @@ impl<D> Clone for RawEvent<'_, D> {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum Event {
-    ReborrowExlusiveInvalidated { pos: u32 },
-    MarkExlusiveInvalidated { pos: u32 },
-    ReborrowSharedInvalidated { pos: u32 },
-    AssertExlusiveInvalidated { pos: u32 },
-    AssertSharedInvalidated { pos: u32 },
-    DropInvalidated { pos: u32 },
+    Major(MajorEvent),
+    Minor(MinorEvent),
+    Invalidated(MajorEvent, u32),
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum MajorEvent {
     ReborrowExlusive,
     MarkExlusive,
     ReborrowShared,
-    MarkShared,
     AssertExlusive,
     AssertShared,
     Drop,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum MinorEvent {
+    MarkShared,
+    Copy,
 }
 
 struct PointerStore<D> {
@@ -571,14 +579,14 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             trackers.call(RawEvent::Event {
-                event: Event::ReborrowExlusive,
+                event: Event::Major(MajorEvent::ReborrowExlusive),
                 ptr: source,
             });
 
             self.memory.for_each(range.clone(), |byte_pos, Stack(byte)| {
                 let pos = 1 + search(source, source_id, byte, &source_range)?;
                 trackers.call(RawEvent::PoppedOff {
-                    event: Event::ReborrowExlusiveInvalidated { pos: byte_pos },
+                    event: Event::Invalidated(MajorEvent::ReborrowExlusive, byte_pos),
 
                     drain: &byte[pos..],
                     info: &store.ptr_info,
@@ -605,7 +613,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             trackers.call(RawEvent::Event {
-                event: Event::ReborrowShared,
+                event: Event::Major(MajorEvent::ReborrowShared),
                 ptr: source,
             });
 
@@ -619,7 +627,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
                 if let Some(offset) = offset {
                     trackers.call(RawEvent::PoppedOff {
-                        event: Event::ReborrowSharedInvalidated { pos: byte_pos },
+                        event: Event::Invalidated(MajorEvent::ReborrowShared, byte_pos),
                         drain: &byte[pos + offset..],
                         info: &store.ptr_info,
                     });
@@ -686,6 +694,11 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
             return Err(Error::NotShared(source))
         }
 
+        self.trackers.call(RawEvent::Event {
+            event: Event::Minor(MinorEvent::Copy),
+            ptr: source,
+        });
+
         info.members.insert(ptr);
         self.allocations[info.alloc_id as usize].insert(ptr);
         self.store.counters.insert(ptr, id);
@@ -703,7 +716,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             trackers.call(RawEvent::Event {
-                event: Event::Drop,
+                event: Event::Major(MajorEvent::Drop),
                 ptr,
             });
 
@@ -712,7 +725,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
                     trackers.call(RawEvent::PoppedOff {
                         drain: byte,
                         info: &store.ptr_info,
-                        event: Event::DropInvalidated { pos: byte_index },
+                        event: Event::Invalidated(MajorEvent::Drop, byte_index),
                     });
                     Ok(false)
                 })?;
@@ -755,7 +768,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
             let range = &info.range;
 
             trackers.call(RawEvent::Event {
-                event: Event::MarkExlusive,
+                event: Event::Major(MajorEvent::MarkExlusive),
                 ptr,
             });
 
@@ -763,7 +776,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
                 let pos = search(ptr, old_id, byte, range).unwrap();
 
                 trackers.call(RawEvent::PoppedOff {
-                    event: Event::MarkExlusiveInvalidated { pos: byte_pos },
+                    event: Event::Invalidated(MajorEvent::MarkExlusive, byte_pos),
                     drain: &byte[pos + 1..],
                     info: ptr_info,
                 });
@@ -788,7 +801,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             trackers.call(RawEvent::Event {
-                event: Event::MarkShared,
+                event: Event::Minor(MinorEvent::MarkShared),
                 ptr,
             });
         }
@@ -814,14 +827,14 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             trackers.call(RawEvent::Event {
-                event: Event::AssertExlusive,
+                event: Event::Major(MajorEvent::AssertExlusive),
                 ptr,
             });
 
             self.memory.for_each(info.range.clone(), |byte_pos, Stack(byte)| {
                 let pos = 1 + search(ptr, id, byte, &info.range).unwrap();
                 trackers.call(RawEvent::PoppedOff {
-                    event: Event::AssertExlusiveInvalidated { pos: byte_pos },
+                    event: Event::Invalidated(MajorEvent::AssertExlusive, byte_pos),
                     drain: &byte[pos..],
                     info: ptr_info,
                 });
@@ -849,7 +862,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
         if !trackers.is_empty() {
             trackers.call(RawEvent::Event {
-                event: Event::AssertShared,
+                event: Event::Major(MajorEvent::AssertShared),
                 ptr,
             });
 
@@ -863,7 +876,7 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
 
                 if let Some(offset) = offset {
                     trackers.call(RawEvent::PoppedOff {
-                        event: Event::AssertSharedInvalidated { pos: byte_pos },
+                        event: Event::Invalidated(MajorEvent::AssertShared, byte_pos),
                         drain: &byte[pos + offset..],
                         info: ptr_info,
                     })
