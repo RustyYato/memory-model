@@ -220,6 +220,7 @@ impl<D> Clone for RawEvent<'_, D> {
     fn clone(&self) -> Self { *self }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum Event {
     ReborrowExlusiveInvalidated { pos: u32 },
@@ -227,12 +228,14 @@ pub enum Event {
     ReborrowSharedInvalidated { pos: u32 },
     AssertExlusiveInvalidated { pos: u32 },
     AssertSharedInvalidated { pos: u32 },
+    DropInvalidated { pos: u32 },
     ReborrowExlusive,
     MarkExlusive,
     ReborrowShared,
     MarkShared,
     AssertExlusive,
     AssertShared,
+    Drop,
 }
 
 struct PointerStore<D> {
@@ -307,6 +310,12 @@ fn vec_retain<T, F: FnMut(&mut T) -> bool>(vec: &mut Vec<T>, mut f: F) {
 }
 
 impl<'env, D> TrackerGroup<'env, D> {
+    pub fn iter(&self) -> impl '_ + Iterator<Item = (Pointer, &'env str)> {
+        self.trackers
+            .iter()
+            .flat_map(|(&ptr, trackers)| trackers.iter().map(move |tracker| (ptr, tracker.tag)))
+    }
+
     pub fn register<F: 'env + FnMut(&'env str, Pointer, Event) + Send>(
         &mut self,
         tag: &'env str,
@@ -616,7 +625,6 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
                     });
                 }
 
-                byte.push(id);
                 Ok(false)
             })?;
         }
@@ -690,16 +698,43 @@ impl<'env, D: Metadata, M: PointerMap> MemoryBlock<'env, D, M> {
             return Err(Error::DeallocateNonOwning(ptr))
         }
 
+        let trackers = &mut self.trackers;
+        let store = &self.store;
+
+        if !trackers.is_empty() {
+            trackers.call(RawEvent::Event {
+                event: Event::Drop,
+                ptr,
+            });
+
+            self.memory
+                .for_each(store.get(ptr)?.1.range.clone(), |byte_index, Stack(byte)| {
+                    trackers.call(RawEvent::PoppedOff {
+                        drain: byte,
+                        info: &store.ptr_info,
+                        event: Event::DropInvalidated { pos: byte_index },
+                    });
+                    Ok(false)
+                })?;
+        }
+
         let info = self.store.dealloc(ptr)?;
         self.deallocated.insert(ptr);
         let mut allocation = self.allocations.remove(info.alloc_id as usize);
+        self.trackers.trackers.remove(&ptr);
 
         for &ptr in allocation.iter() {
             let _ = self.store.drop(ptr);
             self.deallocated.insert(ptr);
+            self.trackers.trackers.remove(&ptr);
         }
 
         allocation.insert(ptr);
+
+        self.memory.for_each(info.range, |_, Stack(byte)| {
+            byte.clear();
+            Ok(true)
+        })?;
 
         Ok(allocation)
     }

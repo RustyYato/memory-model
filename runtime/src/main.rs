@@ -216,13 +216,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = dec::base::indexed::Indexed::new(file.as_str());
     let (input, tokens) = compiler::tokens::parse::<dec::base::error::DefaultError<_>>(input).unwrap();
     if !input.is_empty() {
-        println!("{}", input.inner());
+        eprintln!("{}", input.inner());
         return Err("Could not parse tokens".into())
     }
     let (input, mut instrs) = compiler::ast::parse::<dec::base::error::verbose::VerboseError<_>>(&tokens).unwrap();
     if !input.is_empty() {
-        println!("{:#?}", instrs);
-        println!("{:#?}", input);
+        eprintln!("{:#?}", instrs);
+        eprintln!("{:#?}", input);
         return Err("Could not parse ast".into())
     }
 
@@ -326,7 +326,7 @@ fn run<'a>(
             }
         }
 
-        println!("execute {}", DispSpan::new(&ast.span, line_offsets));
+        eprintln!("execute {}", DispSpan::new(&ast.span, line_offsets));
 
         match &ast.kind {
             AstKind::FuncDecl { .. } => (),
@@ -670,9 +670,6 @@ fn write_expr_to<'a>(
 
     match expr {
         ast::SimpleExpr::Alloc { span, range } => {
-            if span == (215..223) {
-                panic!("{:#?}", model);
-            }
             let (target, ptr) = match to {
                 WriteTo::Target(target) | WriteTo::Pat(ast::SimplePattern::Ident(target)) => {
                     (Some(target.name), allocator.alloc(target.name))
@@ -694,7 +691,7 @@ fn write_expr_to<'a>(
 
             if should_track {
                 eprintln!(
-                    "{}: allocated `{}` as {:?}",
+                    "\t{}: allocated `{}` as {:?}",
                     ShowSpan(&span, line_offsets),
                     target.unwrap_or("<unnamed>"),
                     ptr
@@ -830,7 +827,7 @@ fn borrow<'a>(
 
     if should_track {
         eprintln!(
-            "{}: {} borrow `{}` as {:?} from `{}` ({:?})",
+            "\t{}: {} borrow `{}` as {:?} from `{}` ({:?})",
             ShowSpan(&span, line_offsets),
             if is_exclusive { "exclusive" } else { "shared" },
             target_name,
