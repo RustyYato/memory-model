@@ -75,15 +75,13 @@ pub enum Pattern<'a> {
 pub enum SimpleExpr<'a> {
     Move(Id<'a>),
     Alloc {
-        range: Range<Option<u32>>,
         span: Span,
+        range: Range<Option<u32>>,
     },
     Borrow {
-        source: Id<'a>,
         span: Span,
-        is_exclusive: bool,
-        read: bool,
-        write: bool,
+        source: Id<'a>,
+        ptr_ty: PointerTy,
         range: Option<Range<Option<u32>>>,
     },
 }
@@ -160,7 +158,12 @@ impl<'i> SimpleExpr<'i> {
     pub fn span(&self) -> Span {
         use SimpleExpr::*;
         match self {
-            Alloc { span, .. } | Move(Id { span, .. }) | Borrow { span, .. } => span.clone(),
+            Alloc { span, .. }
+            | Move(Id { span, .. })
+            | Borrow {
+                ptr_ty: PointerTy { span, .. },
+                ..
+            } => span.clone(),
         }
     }
 }
@@ -442,7 +445,7 @@ fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     let expr = match rest {
         None => SimpleExpr::Move(source),
         Some((
-            _sym_borrow,
+            (borrow_start, _sym_borrow),
             (exc_span, is_exclusive),
             Perm {
                 span: perm_span,
@@ -451,18 +454,22 @@ fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
             },
             range,
         )) => {
+            let ty_end = perm_span.unwrap_or(exc_span);
             let (end, range) = match range {
                 Some((end, range)) => (end, Some(range)),
-                None => (perm_span.unwrap_or(exc_span), None),
+                None => (ty_end.clone(), None),
             };
 
             SimpleExpr::Borrow {
                 span: source.span.start..end.end,
                 source,
-                is_exclusive,
-                read,
-                write,
                 range,
+                ptr_ty: PointerTy {
+                    span: borrow_start.start..ty_end.end,
+                    is_exclusive,
+                    read,
+                    write,
+                },
             }
         }
     };
