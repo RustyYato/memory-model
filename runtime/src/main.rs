@@ -18,7 +18,7 @@ mod error;
 enum Error<'a> {
     Alias(memory_model::alias::Error),
     InvalidPtr(&'a str),
-    TypeMismatch { arg: ast::Arg<'a>, farg: ast::Arg<'a> },
+    TypeMismatch { arg: ast::PointerTy, farg: ast::Arg<'a> },
     NoFunction { func: &'a str },
     NoAttribute { attr: ast::Attribute<'a> },
     AllocNoBind { span: ast::Span },
@@ -579,39 +579,57 @@ fn func_call<'m, 'a>(
     assert_eq!(args.len(), func.args.len());
 
     for (farg, expr) in func.args.iter().zip(args.iter()) {
-        // let ty = match farg.ty {
-        //     Some(ref ty) => ty,
-        //     None => continue,
-        // };
+        let ty = match &farg.ty {
+            ast::Type::Pointer(ty) => ty.clone(),
+            ast::Type::Tuple { span, types } => panic!("function arguments can't have tuple args"),
+        };
 
-        // let perm = Permissions {
-        //     read: ty.read,
-        //     write: ty.write,
-        // };
+        let expr_span = expr.span();
 
-        // let ptr = try_or_throw!(allocator.ptr(arg));
-        // let info = try_or_throw!(model.info(ptr));
-        // let is_exclusive = matches!(info.ptr_ty, memory_model::alias::PtrType::Exclusive);
-        // if info.meta == perm && is_exclusive == ty.is_exclusive {
-        //     continue
-        // }
+        let expr_ty = match expr {
+            ast::SimpleExpr::Move(id) => {
+                let ptr = try_or_throw!(allocator.ptr(id.name));
+                let info = try_or_throw!(model.info(ptr));
 
-        // try_or_throw!(
-        //     Err(Error::TypeMismatch {
-        //         arg: ast::Arg {
-        //             name: arg,
-        //             span: span.clone(),
-        //             ty: Some(ast::ArgTy {
-        //                 span: span.clone(),
-        //                 is_exclusive,
-        //                 read: info.meta.read,
-        //                 write: info.meta.write,
-        //             })
-        //         },
-        //         farg: farg.clone(),
-        //     }),
-        //     span = span.clone()
-        // );
+                ast::PointerTy {
+                    is_exclusive: info.ptr_ty == PtrType::Exclusive,
+                    read: info.meta.read,
+                    write: info.meta.write,
+                    span: expr_span,
+                }
+            }
+            ast::SimpleExpr::Alloc { .. } => ast::PointerTy {
+                is_exclusive: true,
+                read: true,
+                write: true,
+                span: expr_span,
+            },
+            &ast::SimpleExpr::Borrow {
+                read,
+                write,
+                is_exclusive,
+                ..
+            } => ast::PointerTy {
+                is_exclusive,
+                read,
+                write,
+                span: expr_span,
+            },
+        };
+
+        let read = ty.read.map_or(true, |read| read == expr_ty.read);
+        let write = ty.write.map_or(true, |write| write == expr_ty.write);
+        if read && write && ty.is_exclusive == expr_ty.is_exclusive {
+            continue
+        }
+
+        try_or_throw!(
+            Err(Error::TypeMismatch {
+                arg: expr_ty,
+                farg: farg.clone(),
+            }),
+            span = span.clone()
+        );
     }
 
     let mut func_allocator = Allocator::default();

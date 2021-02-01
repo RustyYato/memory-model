@@ -1,5 +1,7 @@
 use crate::{Allocator, DispSpan, Error, InvalidKind, Invalidated, ShowSpan};
 
+use compiler::ast;
+
 struct DisplayToDebug<T>(T);
 
 use std::fmt;
@@ -72,21 +74,35 @@ pub(crate) fn handle_error(
             return DisplayToDebug(format!("{}: Unkown attribute {}", span, attr.path.name)).into()
         }
         Error::TypeMismatch { arg, farg } => {
-            let read = ["", " read"];
-            let write = ["", " write"];
+            let read = ["", " read", " _"];
+            let write = ["", " write", " _"];
             let modifier = ["shr", "exc"];
+
+            let ptr_ty = match farg.ty {
+                ast::Type::Tuple { .. } => unreachable!(),
+                ast::Type::Pointer(ptr_ty) => ptr_ty,
+            };
 
             return DisplayToDebug(format!(
                 "\
-{}: Type mismatch: argument `{}` (at {}) didn't match declared argument `{}` (at {}):
+{}: Type mismatch: argument at {} didn't match declared argument `{}` (at {}):
 expected `{:?}`, but got `{:?}`",
                 span,
-                arg.id.name,
-                ShowSpan(&arg.id.span, line_offsets),
+                ShowSpan(&arg.span, line_offsets),
                 farg.id.name,
                 ShowSpan(&farg.id.span, line_offsets),
-                &farg.ty,
-                &arg.ty,
+                format_args!(
+                    "@{}{}{}",
+                    modifier[usize::from(ptr_ty.is_exclusive)],
+                    read[ptr_ty.read.map_or(2, usize::from)],
+                    write[ptr_ty.write.map_or(2, usize::from)],
+                ),
+                format_args!(
+                    "@{}{}{}",
+                    modifier[usize::from(arg.is_exclusive)],
+                    read[usize::from(arg.read)],
+                    write[usize::from(arg.write)],
+                ),
             ))
             .into()
         }
