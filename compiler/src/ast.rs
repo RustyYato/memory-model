@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use dec::{
     base::{
-        error::{CaptureInput, Error, PResult, ParseError},
+        error::{CaptureInput, Error, ErrorKind, PResult, ParseError},
         ParseMut, ParseOnce, Tag,
     },
     branch::any,
@@ -111,7 +111,7 @@ pub struct Attribute<'a> {
 #[derive(Debug, Clone)]
 pub struct Arg<'a> {
     pub id: Id<'a>,
-    pub ty: Type,
+    pub ty: PointerTy<Option<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +300,7 @@ pub fn parse_ast<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         parse_write,
         parse_update,
         parse_func_decl,
+        parse_func_call,
         //
     ))
     .parse_once(input)?;
@@ -424,69 +425,82 @@ fn parse_pattern<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     any((map(parse_simple, Pattern::Simple), parse_tuple)).parse_once(input)
 }
 
-fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
-    fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
-        input: &'t [Token<'i>],
-    ) -> PResult<&'t [Token<'i>], SimpleExpr<'i>, E> {
-        let (input, (source, rest)) = all((
-            IDENT,
-            opt(all((
-                tag(Symbol::Borrow),
-                parse_modifier,
-                parse_permissions,
-                opt(parse_range),
-            ))),
-        ))
-        .parse_once(input)?;
+fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], SimpleExpr<'i>, E> {
+    let (input, (source, rest)) = all((
+        IDENT,
+        opt(all((
+            tag(Symbol::Borrow),
+            parse_modifier,
+            parse_permissions,
+            opt(parse_range),
+        ))),
+    ))
+    .parse_once(input)?;
 
-        let expr = match rest {
-            None => SimpleExpr::Move(source),
-            Some((
-                _sym_borrow,
-                (exc_span, is_exclusive),
-                Perm {
-                    span: perm_span,
-                    read,
-                    write,
-                },
-                range,
-            )) => {
-                let (end, range) = match range {
-                    Some((end, range)) => (end, Some(range)),
-                    None => (perm_span.unwrap_or(exc_span), None),
-                };
-
-                SimpleExpr::Borrow {
-                    span: source.span.start..end.end,
-                    source,
-                    is_exclusive,
-                    read,
-                    write,
-                    range,
-                }
-            }
-        };
-
-        Ok((input, expr))
-    }
-
-    fn parse_new<'i, 't, E: ParseError<&'t [Token<'i>]>>(
-        input: &'t [Token<'i>],
-    ) -> PResult<&'t [Token<'i>], SimpleExpr<'i>, E> {
-        let (input, ((start, _kw_new), (end, range))) = all((tag(Keyword::New), parse_range)).parse_once(input)?;
-
-        Ok((input, SimpleExpr::Alloc {
-            span: start.start..end.end,
+    let expr = match rest {
+        None => SimpleExpr::Move(source),
+        Some((
+            _sym_borrow,
+            (exc_span, is_exclusive),
+            Perm {
+                span: perm_span,
+                read,
+                write,
+            },
             range,
-        }))
-    }
+        )) => {
+            let (end, range) = match range {
+                Some((end, range)) => (end, Some(range)),
+                None => (perm_span.unwrap_or(exc_span), None),
+            };
 
-    fn parse_simple<'i, 't, E: ParseError<&'t [Token<'i>]>>(
-        input: &'t [Token<'i>],
-    ) -> PResult<&'t [Token<'i>], SimpleExpr<'i>, E> {
-        any((parse_borrow, parse_new)).parse_once(input)
-    }
+            SimpleExpr::Borrow {
+                span: source.span.start..end.end,
+                source,
+                is_exclusive,
+                read,
+                write,
+                range,
+            }
+        }
+    };
 
+    Ok((input, expr))
+}
+
+fn parse_new<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], SimpleExpr<'i>, E> {
+    let (input, ((start, _kw_new), (end, range))) = all((tag(Keyword::New), parse_range)).parse_once(input)?;
+
+    Ok((input, SimpleExpr::Alloc {
+        span: start.start..end.end,
+        range,
+    }))
+}
+
+fn parse_simple<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], SimpleExpr<'i>, E> {
+    any((parse_borrow, parse_new)).parse_once(input)
+}
+
+fn parse_func_call_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
+    let (input, (id, (end, args))) =
+        all((IDENT, |input| parse_generic_tuple(input, parse_simple))).parse_once(input)?;
+
+    Ok((input, Expr::FuncCall {
+        span: id.span.start..end.end,
+        id,
+        args,
+    }))
+}
+
+fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
     fn parse_tuple<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         input: &'t [Token<'i>],
     ) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
@@ -494,20 +508,29 @@ fn parse_expr<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) ->
         Ok((input, Expr::Tuple { exprs, span }))
     }
 
-    fn parse_func_call<'i, 't, E: ParseError<&'t [Token<'i>]>>(
-        input: &'t [Token<'i>],
-    ) -> PResult<&'t [Token<'i>], Expr<'i>, E> {
-        let (input, (id, (end, args))) =
-            all((IDENT, |input| parse_generic_tuple(input, parse_simple))).parse_once(input)?;
+    any((parse_func_call_expr, map(parse_simple, Expr::Simple), parse_tuple)).parse_once(input)
+}
 
-        Ok((input, Expr::FuncCall {
-            span: id.span.start..end.end,
-            id,
-            args,
-        }))
-    }
+fn parse_func_call<'i, 't, E: ParseError<&'t [Token<'i>]>>(
+    input: &'t [Token<'i>],
+) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
+    let (input, (id, (_, args), (end, _sym_semi))) = all((
+        IDENT,
+        |input| parse_generic_tuple(input, parse_simple),
+        tag(Symbol::SemiColon),
+    ))
+    .parse_once(input)?;
 
-    any((parse_func_call, map(parse_simple, Expr::Simple), parse_tuple)).parse_once(input)
+    let span = id.span.start..end.end;
+
+    Ok((input, Ast {
+        attrs: Vec::new(),
+        span: span.clone(),
+        kind: AstKind::Let {
+            pat: Pattern::Simple(SimplePattern::Ignore(0..0)),
+            expr: Expr::FuncCall { span, id, args },
+        },
+    }))
 }
 
 fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
@@ -546,9 +569,16 @@ fn parse_func_decl<'i, 't, E: ParseError<&'t [Token<'i>]>>(
 }
 
 fn parse_arg<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Arg<'i>, E> {
+    let old_input = input;
     let (input, (id, ty)) = all((IDENT, dec::seq::snd(tag(Symbol::Colon), parse_ty))).parse_once(input)?;
 
-    Ok((input, Arg { id, ty }))
+    match ty {
+        Type::Pointer(ty) => Ok((input, Arg { id, ty })),
+        Type::Tuple { .. } => Err(Error::Error(E::from_input_kind(
+            old_input,
+            ErrorKind::Custom("tuple types not allows for arguments"),
+        ))),
+    }
 }
 
 fn parse_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Type, E> {

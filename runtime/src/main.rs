@@ -20,11 +20,26 @@ enum Error<'a> {
     InvalidPtr(&'a str),
     UseAfterMove(&'a str, ast::Span),
     UseAfterFree(&'a str, ast::Span),
-    TypeMismatch { arg: ast::PointerTy, farg: ast::Arg<'a> },
-    NoFunction { func: &'a str },
-    NoAttribute { attr: ast::Attribute<'a> },
-    AllocNoBind { span: ast::Span },
-    AllocRangeBoundsNotSpecied { span: ast::Span },
+    ArgTypeMismatch {
+        arg: ast::PointerTy,
+        farg: ast::Arg<'a>,
+    },
+    ReturnTypeMismatch {
+        val: Option<ast::Span>,
+        ret: Option<ast::Type>,
+    },
+    NoFunction {
+        func: &'a str,
+    },
+    NoAttribute {
+        attr: ast::Attribute<'a>,
+    },
+    AllocNoBind {
+        span: ast::Span,
+    },
+    AllocRangeBoundsNotSpecied {
+        span: ast::Span,
+    },
 }
 
 impl From<memory_model::alias::Error> for Error<'_> {
@@ -428,6 +443,7 @@ fn run<'a>(
                 let (func, mut func_allocator) =
                     func_call(id.clone(), args, expr_span.clone(), line_offsets, map, model, allocator)?;
                 match &func.ret_value {
+                    None => (),
                     Some(ast::Expr::Simple(expr)) => write_expr_to(
                         WriteTo::Pat(pat.clone()),
                         expr.clone(),
@@ -652,14 +668,9 @@ fn func_call<'m, 'a>(
     assert_eq!(args.len(), func.args.len());
 
     for (farg, expr) in func.args.iter().zip(args.iter()) {
-        let ty = match &farg.ty {
-            ast::Type::Pointer(ty) => ty.clone(),
-            ast::Type::Tuple { span, types } => panic!("function arguments can't have tuple args"),
-        };
-
-        if let Err(expr_ty) = check_simple_expr(ty, expr, line_offsets, model, allocator)? {
+        if let Err(expr_ty) = check_simple_expr(farg.ty.clone(), expr, line_offsets, model, allocator)? {
             try_or_throw!(
-                Err(Error::TypeMismatch {
+                Err(Error::ArgTypeMismatch {
                     arg: expr_ty,
                     farg: farg.clone(),
                 }),
@@ -698,6 +709,60 @@ fn func_call<'m, 'a>(
     }
 
     run(instrs, line_offsets, map, model, &mut func_allocator)?;
+
+    match (&func.ret_ty, &func.ret_value) {
+        (None, None) => {}
+        (Some(ast::Type::Pointer(ptr_ty)), Some(ast::Expr::Simple(ret_value))) => {
+            if let Err(expr_ty) =
+                check_simple_expr(ptr_ty.clone(), ret_value, line_offsets, model, &mut func_allocator)?
+            {
+                try_or_throw!(
+                    Err(Error::ReturnTypeMismatch {
+                        val: Some(ret_value.span()),
+                        ret: Some(ast::Type::Pointer(ptr_ty.clone())),
+                    }),
+                    span = ret_value.span()
+                )
+            }
+        }
+        (Some(ast::Type::Tuple { span: ty_span, types }), Some(ast::Expr::Tuple { span: expr_span, exprs })) => {
+            if types.len() != exprs.len() {
+                try_or_throw!(
+                    Err(Error::ReturnTypeMismatch {
+                        val: Some(expr_span.clone()),
+                        ret: Some(ast::Type::Tuple {
+                            span: ty_span.clone(),
+                            types: types.clone()
+                        }),
+                    }),
+                    span = expr_span.clone()
+                )
+            }
+
+            for (ty, expr) in types.iter().zip(exprs) {
+                if let Err(expr_ty) = check_simple_expr(ty.clone(), expr, line_offsets, model, &mut func_allocator)? {
+                    try_or_throw!(
+                        Err(Error::ReturnTypeMismatch {
+                            val: Some(expr.span()),
+                            ret: Some(ast::Type::Pointer(ty.clone())),
+                        }),
+                        span = expr.span()
+                    )
+                }
+            }
+        }
+        (None, Some(expr)) => {
+            try_or_throw!(
+                Err(Error::ReturnTypeMismatch {
+                    val: Some(expr.span()),
+                    ret: None,
+                }),
+                span = expr.span()
+            )
+        }
+        // (Some(ret_ty), Some(ref_value)) => {}
+        _ => unreachable!(),
+    }
 
     Ok((func, func_allocator))
 }

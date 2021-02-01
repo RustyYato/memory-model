@@ -67,15 +67,10 @@ pub(crate) fn handle_error(
         Error::NoAttribute { attr } => {
             return DisplayToDebug(format!("{}: Unkown attribute {}", span, attr.path.name)).into()
         }
-        Error::TypeMismatch { arg, farg } => {
+        Error::ArgTypeMismatch { arg, farg } => {
             let read = ["", " read", " _"];
             let write = ["", " write", " _"];
             let modifier = ["shr", "exc"];
-
-            let ptr_ty = match farg.ty {
-                ast::Type::Tuple { .. } => unreachable!(),
-                ast::Type::Pointer(ptr_ty) => ptr_ty,
-            };
 
             return DisplayToDebug(format!(
                 "\
@@ -87,9 +82,9 @@ expected `{:?}`, but got `{:?}`",
                 ShowSpan(&farg.id.span, line_offsets),
                 format_args!(
                     "@{}{}{}",
-                    modifier[usize::from(ptr_ty.is_exclusive)],
-                    read[ptr_ty.read.map_or(2, usize::from)],
-                    write[ptr_ty.write.map_or(2, usize::from)],
+                    modifier[usize::from(farg.ty.is_exclusive)],
+                    read[farg.ty.read.map_or(2, usize::from)],
+                    write[farg.ty.write.map_or(2, usize::from)],
                 ),
                 format_args!(
                     "@{}{}{}",
@@ -100,6 +95,7 @@ expected `{:?}`, but got `{:?}`",
             ))
             .into()
         }
+        Error::ReturnTypeMismatch { val, ret } => panic!("MISMATCHED RETURN TYPE {:?} {:?}", val, ret),
     };
 
     let err = match err {
