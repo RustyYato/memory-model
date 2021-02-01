@@ -43,30 +43,24 @@ pub(crate) fn handle_error(
             ))
             .into()
         }
-        Error::InvalidPtr(ptr) => {
-            let err = match allocator.invalidated.get(ptr) {
-                Some(Invalidated {
-                    kind: InvalidKind::Freed,
-                    span: freed_span,
-                }) => format!(
-                    "{}: Use of freed pointer `{ptr}`. Note: freed `{ptr}` at {freed_span}",
-                    span,
-                    ptr = ptr,
-                    freed_span = ShowSpan(&freed_span, line_offsets)
-                ),
-                Some(Invalidated {
-                    kind: InvalidKind::Moved,
-                    span: moved_span,
-                }) => format!(
-                    "{}: Use of moved pointer `{ptr}`. Note: moved `{ptr}` at {moved_span}",
-                    span,
-                    ptr = ptr,
-                    moved_span = ShowSpan(&moved_span, line_offsets)
-                ),
-                None => format!("{}: Unknown pointer `{}`", span, ptr),
-            };
-
-            return DisplayToDebug(err).into()
+        Error::InvalidPtr(ptr) => return DisplayToDebug(format!("{}: Unknown pointer `{}`", span, ptr)).into(),
+        Error::UseAfterFree(ptr, freed_span) => {
+            return DisplayToDebug(format!(
+                "{}: Use of freed pointer `{ptr}`. Note: freed `{ptr}` at {freed_span}",
+                span,
+                ptr = ptr,
+                freed_span = ShowSpan(&freed_span, line_offsets)
+            ))
+            .into()
+        }
+        Error::UseAfterMove(ptr, moved_span) => {
+            return DisplayToDebug(format!(
+                "{}: Use of moved pointer `{ptr}`. Note: moved `{ptr}` at {moved_span}",
+                span,
+                ptr = ptr,
+                moved_span = ShowSpan(&moved_span, line_offsets)
+            ))
+            .into()
         }
 
         Error::NoFunction { func } => return DisplayToDebug(format!("{}: Unkown function {}", span, func)).into(),

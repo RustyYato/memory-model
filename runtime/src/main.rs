@@ -18,6 +18,8 @@ mod error;
 enum Error<'a> {
     Alias(memory_model::alias::Error),
     InvalidPtr(&'a str),
+    UseAfterMove(&'a str, ast::Span),
+    UseAfterFree(&'a str, ast::Span),
     TypeMismatch { arg: ast::PointerTy, farg: ast::Arg<'a> },
     NoFunction { func: &'a str },
     NoAttribute { attr: ast::Attribute<'a> },
@@ -51,6 +53,7 @@ struct Function<'a> {
     instrs: Vec<Ast<'a>>,
     ret_value: Option<ast::Expr<'a>>,
     ret_ty: Option<ast::Type>,
+    ret_ty_span: ast::Span,
 }
 
 #[derive(Clone, Copy)]
@@ -156,7 +159,22 @@ impl<'a> Allocator<'a> {
 
     fn ptr<'n>(&self, name: impl Into<AllocId<'n>>) -> Result<Pointer, Error<'n>> {
         match name.into() {
-            AllocId::Named(name) => self.name_to_ptr.get(name).copied().ok_or(Error::InvalidPtr(name)),
+            AllocId::Named(name) => {
+                self.name_to_ptr
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| match self.invalidated.get(name) {
+                        Some(Invalidated {
+                            span,
+                            kind: InvalidKind::Freed,
+                        }) => Error::UseAfterFree(name, span.clone()),
+                        Some(Invalidated {
+                            span,
+                            kind: InvalidKind::Moved,
+                        }) => Error::UseAfterMove(name, span.clone()),
+                        None => Error::InvalidPtr(name),
+                    })
+            }
             AllocId::Temp(temp) => Ok(self.temp_to_ptr[&temp]),
         }
     }
@@ -261,6 +279,10 @@ fn build_function_map<'a>(instrs: &mut Vec<Ast<'a>>) -> Result<FunctionMap<'a>, 
         match map.entry(id.name) {
             Entry::Vacant(entry) => {
                 entry.insert(Function {
+                    ret_ty_span: match ret_ty {
+                        Some(ref ty) => ty.span(),
+                        None => id.span.clone(),
+                    },
                     args,
                     map: build_function_map(&mut instrs)?,
                     instrs,
@@ -470,7 +492,7 @@ fn run<'a>(
                         span: ref expr_span,
                     },
             } => {
-                let (func, func_allocator) =
+                let (func, mut func_allocator) =
                     func_call(id.clone(), args, expr_span.clone(), line_offsets, map, model, allocator)?;
                 match &func.ret_value {
                     Some(ast::Expr::Simple(expr)) => write_expr_to(
@@ -482,7 +504,7 @@ fn run<'a>(
                         map,
                         model,
                         allocator,
-                        None,
+                        Some(&mut func_allocator),
                     )?,
                     _ => panic!(),
                 }
@@ -548,6 +570,57 @@ fn run<'a>(
     Ok(())
 }
 
+fn check_simple_expr<'a>(
+    ty: ast::PointerTy<Option<bool>>,
+    expr: &ast::SimpleExpr,
+    line_offsets: &[usize],
+    model: &mut State<'a>,
+    allocator: &mut Allocator<'a>,
+) -> Result<Result<(), ast::PointerTy>, Box<dyn std::error::Error>> {
+    mk_try_or_throw!($, expr.span(), allocator, line_offsets);
+
+    let expr_span = expr.span();
+
+    let expr_ty = match expr {
+        ast::SimpleExpr::Move(id) => {
+            let ptr = try_or_throw!(allocator.ptr(id.name));
+            let info = try_or_throw!(model.info(ptr));
+
+            ast::PointerTy {
+                is_exclusive: info.ptr_ty == PtrType::Exclusive,
+                read: info.meta.read,
+                write: info.meta.write,
+                span: expr_span,
+            }
+        }
+        ast::SimpleExpr::Alloc { .. } => ast::PointerTy {
+            is_exclusive: true,
+            read: true,
+            write: true,
+            span: expr_span,
+        },
+        &ast::SimpleExpr::Borrow {
+            read,
+            write,
+            is_exclusive,
+            ..
+        } => ast::PointerTy {
+            is_exclusive,
+            read,
+            write,
+            span: expr_span,
+        },
+    };
+
+    let read = ty.read.map_or(true, |read| read == expr_ty.read);
+    let write = ty.write.map_or(true, |write| write == expr_ty.write);
+    if read && write && ty.is_exclusive == expr_ty.is_exclusive {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(expr_ty))
+    }
+}
+
 fn func_call<'m, 'a>(
     id: ast::Id<'a>,
     args: &[ast::SimpleExpr<'a>],
@@ -557,7 +630,7 @@ fn func_call<'m, 'a>(
     model: &mut State<'a>,
     allocator: &mut Allocator<'a>,
 ) -> Result<(&'m Function<'a>, Allocator<'a>), Box<dyn std::error::Error>> {
-    mk_try_or_throw!($, todo!(), allocator, line_offsets);
+    mk_try_or_throw!($, span, allocator, line_offsets);
 
     let mut map_ = &map;
     let func = loop {
@@ -584,52 +657,15 @@ fn func_call<'m, 'a>(
             ast::Type::Tuple { span, types } => panic!("function arguments can't have tuple args"),
         };
 
-        let expr_span = expr.span();
-
-        let expr_ty = match expr {
-            ast::SimpleExpr::Move(id) => {
-                let ptr = try_or_throw!(allocator.ptr(id.name));
-                let info = try_or_throw!(model.info(ptr));
-
-                ast::PointerTy {
-                    is_exclusive: info.ptr_ty == PtrType::Exclusive,
-                    read: info.meta.read,
-                    write: info.meta.write,
-                    span: expr_span,
-                }
-            }
-            ast::SimpleExpr::Alloc { .. } => ast::PointerTy {
-                is_exclusive: true,
-                read: true,
-                write: true,
-                span: expr_span,
-            },
-            &ast::SimpleExpr::Borrow {
-                read,
-                write,
-                is_exclusive,
-                ..
-            } => ast::PointerTy {
-                is_exclusive,
-                read,
-                write,
-                span: expr_span,
-            },
-        };
-
-        let read = ty.read.map_or(true, |read| read == expr_ty.read);
-        let write = ty.write.map_or(true, |write| write == expr_ty.write);
-        if read && write && ty.is_exclusive == expr_ty.is_exclusive {
-            continue
+        if let Err(expr_ty) = check_simple_expr(ty, expr, line_offsets, model, allocator)? {
+            try_or_throw!(
+                Err(Error::TypeMismatch {
+                    arg: expr_ty,
+                    farg: farg.clone(),
+                }),
+                span = expr.span()
+            )
         }
-
-        try_or_throw!(
-            Err(Error::TypeMismatch {
-                arg: expr_ty,
-                farg: farg.clone(),
-            }),
-            span = span.clone()
-        );
     }
 
     let mut func_allocator = Allocator::default();
