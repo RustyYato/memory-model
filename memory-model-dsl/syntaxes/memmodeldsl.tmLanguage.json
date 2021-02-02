@@ -42,7 +42,7 @@
 			"patterns": [
 				{
 					"name": "keyword.control.less",
-					"match": "\\b(read|write)\\b"
+					"match": "\\b(read|write|valid)\\b"
 				}
 			]
 		},

@@ -50,6 +50,7 @@ impl From<memory_model::alias::Error> for Error<'_> {
 pub struct Permissions {
     pub read: bool,
     pub write: bool,
+    pub valid: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +147,7 @@ impl Metadata for Permissions {
         Self {
             read: true,
             write: true,
+            valid: false,
         }
     }
 
@@ -553,6 +555,7 @@ fn run<'a>(instrs: &[Ast<'a>], mut ctx: Context<'a, '_, '_, '_, '_>) -> Result<(
                 is_exclusive,
                 read,
                 write,
+                valid,
             } => {
                 let ptr = try_or_throw!(ctx.allocator.ptr(id.name));
                 let res = if is_exclusive {
@@ -561,7 +564,7 @@ fn run<'a>(instrs: &[Ast<'a>], mut ctx: Context<'a, '_, '_, '_, '_>) -> Result<(
                     ctx.model.mark_shared(ptr)
                 };
                 try_or_throw!(res);
-                let res = ctx.model.update_meta(ptr, |_| Permissions { read, write });
+                let res = ctx.model.update_meta(ptr, |_| Permissions { read, write, valid });
                 try_or_throw!(res);
             }
             &AstKind::Write { ref id, is_exclusive } => {
@@ -609,6 +612,7 @@ fn check_simple_expr<'a>(
                 is_exclusive: info.ptr_ty == PtrType::Exclusive,
                 read: info.meta.read,
                 write: info.meta.write,
+                valid: info.meta.valid,
                 span: expr_span,
             }
         }
@@ -616,6 +620,7 @@ fn check_simple_expr<'a>(
             is_exclusive: true,
             read: true,
             write: true,
+            valid: false,
             span: expr_span,
         },
     };
@@ -910,25 +915,6 @@ fn borrow<'a>(
         None => Pointer::create(),
     };
 
-    let info = try_or_throw!(ctx.model.info(source));
-    let source_range = &info.range;
-    let range = range.unwrap_or(None..None);
-    let start = range.start.unwrap_or(source_range.start);
-    let end = range.end.unwrap_or(source_range.end);
-    let range = start..end;
-
-    let meta = Permissions {
-        read: ptr_ty.read,
-        write: ptr_ty.write,
-    };
-
-    let res = if ptr_ty.is_exclusive {
-        ctx.model.reborrow_exclusive(ptr, source, range, meta)
-    } else {
-        ctx.model.reborrow_shared(ptr, source, range, meta)
-    };
-    try_or_throw!(res);
-
     if should_track {
         eprintln!(
             "\t{}: {} borrow `{}` as {:?} from `{}` ({:?})",
@@ -941,6 +927,26 @@ fn borrow<'a>(
         );
         ctx.model.trackers.register(target_name, ptr, event_handler);
     }
+
+    let info = try_or_throw!(ctx.model.info(source));
+    let source_range = &info.range;
+    let range = range.unwrap_or(None..None);
+    let start = range.start.unwrap_or(source_range.start);
+    let end = range.end.unwrap_or(source_range.end);
+    let range = start..end;
+
+    let meta = Permissions {
+        read: ptr_ty.read,
+        write: ptr_ty.write,
+        valid: ptr_ty.valid,
+    };
+
+    let res = if ptr_ty.is_exclusive {
+        ctx.model.reborrow_exclusive(ptr, source, range, meta)
+    } else {
+        ctx.model.reborrow_shared(ptr, source, range, meta)
+    };
+    try_or_throw!(res);
 
     Ok(())
 }

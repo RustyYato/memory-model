@@ -10,5 +10,4 @@ edition = "2018"
 dec = { path = '../../parser/dec' }
 memchr = '2'
 hashbrown = "0.9"
-beef = '0.5'
 fxhash = '0.2'

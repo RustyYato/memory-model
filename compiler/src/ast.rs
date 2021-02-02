@@ -43,6 +43,7 @@ pub enum AstKind<'i> {
         is_exclusive: bool,
         read: bool,
         write: bool,
+        valid: bool,
     },
     FuncDecl {
         id: Id<'i>,
@@ -125,6 +126,7 @@ struct Perm {
     span: Option<Span>,
     read: bool,
     write: bool,
+    valid: bool,
 }
 
 impl SimplePattern<'_> {
@@ -152,6 +154,7 @@ pub struct PointerTy<R = bool> {
     pub is_exclusive: bool,
     pub read: R,
     pub write: R,
+    pub valid: R,
 }
 
 impl<'i> SimpleExpr<'i> {
@@ -346,16 +349,30 @@ fn parse_write<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -
 fn parse_update<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Ast<'i>, E> {
-    let (input, (id, _sym_arrow, _sym_borrow, (_, is_exclusive), Perm { span: _, read, write }, (end, _sym_semi))) =
-        all((
-            IDENT,
-            tag(Symbol::Arrow),
-            tag(Symbol::Borrow),
-            parse_modifier,
-            parse_permissions,
-            tag(Symbol::SemiColon),
-        ))
-        .parse_once(input)?;
+    let (
+        input,
+        (
+            id,
+            _sym_arrow,
+            _sym_borrow,
+            (_, is_exclusive),
+            Perm {
+                span: _,
+                read,
+                write,
+                valid,
+            },
+            (end, _sym_semi),
+        ),
+    ) = all((
+        IDENT,
+        tag(Symbol::Arrow),
+        tag(Symbol::Borrow),
+        parse_modifier,
+        parse_permissions,
+        tag(Symbol::SemiColon),
+    ))
+    .parse_once(input)?;
     Ok((input, Ast {
         attrs: Vec::new(),
         span: id.span.start..end.end,
@@ -364,6 +381,7 @@ fn parse_update<'i, 't, E: ParseError<&'t [Token<'i>]>>(
             is_exclusive,
             read,
             write,
+            valid,
         },
     }))
 }
@@ -451,6 +469,7 @@ fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
                 span: perm_span,
                 read,
                 write,
+                valid,
             },
             range,
         )) => {
@@ -469,6 +488,7 @@ fn parse_borrow<'i, 't, E: ParseError<&'t [Token<'i>]>>(
                     is_exclusive,
                     read,
                     write,
+                    valid,
                 },
             }
         }
@@ -589,41 +609,47 @@ fn parse_arg<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> 
 }
 
 fn parse_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> PResult<&'t [Token<'i>], Type, E> {
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::unnecessary_wraps)]
     fn parse_permissions_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         input: &'t [Token<'i>],
-    ) -> PResult<&'t [Token<'i>], (Option<Span>, Option<bool>, Option<bool>), E> {
-        let (input, kw) =
-            opt(any((tag(Keyword::Read), tag(Keyword::Write), tag(Keyword::Ignore)))).parse_once(input)?;
-        match kw {
-            None => Ok((input, (None, Some(false), Some(false)))),
-            Some((range, Keyword::Ignore)) => Ok((input, (Some(range), None, None))),
-            Some((start, Keyword::Write)) => {
-                let (input, read) = opt(any((tag(Keyword::Read), tag(Keyword::Ignore)))).parse_once(input)?;
-                match read {
-                    None => Ok((input, (Some(start), Some(false), Some(true)))),
-                    Some((end, Keyword::Read)) => Ok((input, (Some(start.start..end.end), Some(true), Some(true)))),
-                    Some((end, Keyword::Ignore)) => Ok((input, (Some(start.start..end.end), None, Some(true)))),
-                    _ => unreachable!(),
-                }
-            }
-            Some((start, Keyword::Read)) => {
-                let (input, write) = opt(any((tag(Keyword::Write), tag(Keyword::Ignore)))).parse_once(input)?;
-                match write {
-                    None => Ok((input, (Some(start), Some(true), Some(false)))),
-                    Some((end, Keyword::Write)) => Ok((input, (Some(start.start..end.end), Some(true), Some(true)))),
-                    Some((end, Keyword::Ignore)) => Ok((input, (Some(start.start..end.end), Some(true), None))),
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+    ) -> PResult<&'t [Token<'i>], (Option<Span>, Option<bool>, Option<bool>, Option<bool>), E> {
+        let temp_input = &input[..input.len().min(3)];
+        let (found_ignore, pos) = temp_input
+            .iter()
+            .position(|tok| tok.kind == TokenKind::Keyword(Keyword::Ignore))
+            .map_or((false, temp_input.len()), |pos| (true, pos));
+        let pos = temp_input.len().min(pos);
+        let temp_input = &temp_input[..pos];
+
+        let (temp_input, (read, write, valid)) =
+            dec::branch::any_set((tag(Keyword::Read), tag(Keyword::Write), tag(Keyword::Valid)))
+                .parse_once(temp_input)?;
+        let input = &input[pos - temp_input.len()..];
+
+        let default = [Some(false), None][usize::from(found_ignore)];
+
+        let (span, read) = match read {
+            Some((span, _)) => (Some(span), Some(true)),
+            None => (None, default),
+        };
+
+        let (span, write) = match write {
+            Some((s, _)) => (Some(merge_span(s, span)), Some(true)),
+            None => (None, default),
+        };
+
+        let (span, valid) = match valid {
+            Some((s, _)) => (Some(merge_span(s, span)), Some(true)),
+            None => (None, default),
+        };
+
+        Ok((input, (span, read, write, valid)))
     }
 
     fn parse_pointer_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(
         input: &'t [Token<'i>],
     ) -> PResult<&'t [Token<'i>], PointerTy<Option<bool>>, E> {
-        let (input, ((start, _sym_borrow), (span, is_exclusive), (end, read, write))) =
+        let (input, ((start, _sym_borrow), (span, is_exclusive), (end, read, write, valid))) =
             all((tag(Symbol::Borrow), parse_modifier, parse_permissions_ty)).parse_once(input)?;
 
         let end = end.unwrap_or(span);
@@ -633,6 +659,7 @@ fn parse_ty<'i, 't, E: ParseError<&'t [Token<'i>]>>(input: &'t [Token<'i>]) -> P
             is_exclusive,
             read,
             write,
+            valid,
         }))
     }
 
@@ -656,50 +683,41 @@ fn parse_modifier<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     }
 }
 
+fn merge_span(span: Span, other: Option<Span>) -> Span {
+    match other {
+        Some(other) => span.start.min(other.start)..span.end.max(other.end),
+        None => span,
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
 fn parse_permissions<'i, 't, E: ParseError<&'t [Token<'i>]>>(
     input: &'t [Token<'i>],
 ) -> PResult<&'t [Token<'i>], Perm, E> {
-    let (input, is_write) = opt(any((tag(Keyword::Read), tag(Keyword::Write)))).parse_once(input)?;
-    match is_write {
-        None => Ok((input, Perm {
-            span: None,
-            read: false,
-            write: false,
-        })),
-        Some((start, Keyword::Write)) => {
-            let (input, read) = opt(tag(Keyword::Read)).parse_once(input)?;
-            if let Some((end, _kw_read)) = read {
-                Ok((input, Perm {
-                    span: Some(start.start..end.end),
-                    read: true,
-                    write: true,
-                }))
-            } else {
-                Ok((input, Perm {
-                    span: Some(start),
-                    read: false,
-                    write: true,
-                }))
-            }
-        }
-        Some((start, Keyword::Read)) => {
-            let (input, write) = opt(tag(Keyword::Write)).parse_once(input)?;
-            if let Some((end, _kw_write)) = write {
-                Ok((input, Perm {
-                    span: Some(start.start..end.end),
-                    read: true,
-                    write: true,
-                }))
-            } else {
-                Ok((input, Perm {
-                    span: Some(start),
-                    read: true,
-                    write: false,
-                }))
-            }
-        }
-        _ => unreachable!(),
-    }
+    let (input, (read, write, valid)) =
+        dec::branch::any_set((tag(Keyword::Read), tag(Keyword::Write), tag(Keyword::Valid))).parse_once(input)?;
+
+    let (span, read) = match read {
+        Some((span, _)) => (Some(span), true),
+        None => (None, false),
+    };
+
+    let (span, write) = match write {
+        Some((s, _)) => (Some(merge_span(s, span)), true),
+        None => (None, false),
+    };
+
+    let (span, valid) = match valid {
+        Some((s, _)) => (Some(merge_span(s, span)), true),
+        None => (None, false),
+    };
+
+    Ok((input, Perm {
+        span,
+        read,
+        write,
+        valid,
+    }))
 }
 
 #[allow(clippy::type_complexity)]
